@@ -14,4 +14,14 @@ trainer:
     remove_unused_columns: False
 
 mode: train
-task_name: ??? 
+
+# 这里是添加的 datasets 配置组
+datasets:
+  data:
+    train:
+      TOFU_QA_retain:
+        args:
+          hf_args:
+            name: "retain99"  # 这里定义数据集的分割名，例如 "retain99"
+          
+task_name: "3B_FedAvg_Retain_retain99"  # 设置任务名称

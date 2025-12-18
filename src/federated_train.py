@@ -54,8 +54,12 @@ def main(cfg: DictConfig):
     logger.info(f"----------Initializing Data----------")
     logger.info(data)
     
-    is_federated = cfg.trainer.handler in ["FederatedUnlearningTrainer", "FederatedFinetuneTrainer"]
-    
+    is_federated = cfg.trainer.handler in [
+    "FederatedUnlearningTrainer",
+    "FederatedFinetuneTrainer",
+    "FederatedPermTrainer",  # ← 新增
+]
+
     if is_federated:
         num_clients = cfg.trainer.method_args.get("num_clients", 3)
         target_client_idx = cfg.trainer.method_args.get("target_client_idx", 0)
