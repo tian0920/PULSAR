@@ -11,7 +11,6 @@ from trainer.federated.federated_utils import (
     apply_permutation,
     apply_inverse_permutation,
     apply_adversarial_filter,
-    compute_model_update,
 )
 from peft import PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
 from trainer.unlearn.grad_diff import GradDiff
@@ -101,6 +100,8 @@ class FederatedPermTrainer(FinetuneTrainer):
         self.model = self.model.cpu()
         self.model = deepcopy(self.model)
         
+        self._should_trigger_revocation = False
+
         for round_idx in range(self.global_rounds):
             logger.info(f"Starting global round {round_idx + 1}/{self.global_rounds}")
             
@@ -108,6 +109,9 @@ class FederatedPermTrainer(FinetuneTrainer):
             if self.enable_revocation and not self.revocation_status:
                 if self.revocation_round is not None and round_idx == self.revocation_round:
                     self._trigger_revocation(round_idx)
+                if getattr(self, "_should_trigger_revocation", False):
+                    self._trigger_revocation(round_idx)
+                    self._should_trigger_revocation = False
                 # Note: Manual revocation can be triggered via trigger_revocation() method
             
             # Phase 1: Client Selection & Distribution
@@ -142,8 +146,11 @@ class FederatedPermTrainer(FinetuneTrainer):
                         filtered_state = global_state.copy()
                     
                     # Step 2: Apply structural obfuscation
-                    # Generate permutation key for this round
-                    perm_key = generate_permutation_key(filtered_state, seed=round_idx * 1000 + client_idx)
+                    perm_key = generate_permutation_key(
+                        filtered_state,
+                        seed=round_idx * 1000 + client_idx,
+                        predicate=self._is_adapter_parameter,
+                    )
                     self.permutation_keys[round_idx] = {client_idx: perm_key}
                     
                     # Apply permutation
@@ -221,105 +228,105 @@ class FederatedPermTrainer(FinetuneTrainer):
         self.save_state()
         return None
 
-def _trigger_revocation(self, round_idx: int):
-    """
-    触发授权撤销：在 Client A 的遗忘数据上训练出一个“已遗忘”的模型，
-    再用 (Theta^t - Theta_unlearn) 构造过滤器 F_A。
-    """
-    logger.info(f"=== Triggering Revocation at Round {round_idx} ===")
-    logger.info(f"Client A (idx {self.revoker_client_idx}) optimizing filter F_A")
-
-    if self.revoker_client_idx not in self.federated_dataset:
-        logger.warning(
-            f"Revoker client {self.revoker_client_idx} has no data, skipping revocation"
-        )
-        return
-
-    client_A_dataset = self.federated_dataset[self.revoker_client_idx]
-
-    # 1. 准备“忘记 + 保留”数据
-    # 如果是 unlearn 模式，client_A_dataset 通常是 ForgetRetainDataset，包含 .forget / .retain
-    if hasattr(client_A_dataset, "forget") and hasattr(client_A_dataset, "retain"):
-        forget_dataset = client_A_dataset.forget
-        retain_dataset = client_A_dataset.retain
-        retain_inner = getattr(retain_dataset, "retain", retain_dataset)
-    else:
-        # 否则退化为：全量数据当作 forget，retain 用同一份数据
-        forget_dataset = client_A_dataset
-        retain_inner = client_A_dataset
-
-    class CombinedDataset(Dataset):
+    def _trigger_revocation(self, round_idx: int):
         """
-        简化版 Combine：每个样本同时提供 forget 和 retain，
-        方便直接复用 GradDiff 的 compute_loss 逻辑。
+        触发授权撤销：在 Client A 的遗忘数据上训练出一个“已遗忘”的模型，
+        再用 (Theta^t - Theta_unlearn) 构造过滤器 F_A。
         """
-        def __init__(self, forget_data, retain_data):
-            self.forget_data = forget_data
-            self.retain_data = retain_data
-            self.retain_len = len(retain_data)
+        logger.info(f"=== Triggering Revocation at Round {round_idx} ===")
+        logger.info(f"Client A (idx {self.revoker_client_idx}) optimizing filter F_A")
 
-        def __len__(self):
-            return len(self.forget_data)
+        if self.revoker_client_idx not in self.federated_dataset:
+            logger.warning(
+                f"Revoker client {self.revoker_client_idx} has no data, skipping revocation"
+            )
+            return
 
-        def __getitem__(self, idx):
-            retain_idx = idx % self.retain_len
-            return {
-                "forget": self.forget_data[idx],
-                "retain": self.retain_data[retain_idx],
-            }
+        client_A_dataset = self.federated_dataset[self.revoker_client_idx]
 
-    combined_dataset = CombinedDataset(forget_dataset, retain_inner)
-
-    # 2. 构造一个用于遗忘阶段的 Trainer（GradDiff）
-    unlearn_args = deepcopy(self.args)
-    if self.unlearn_epochs is not None:
-        unlearn_args.num_train_epochs = self.unlearn_epochs
-        logger.info(f"Using {self.unlearn_epochs} epochs for unlearn stage")
-    else:
-        logger.info(f"Using default {unlearn_args.num_train_epochs} epochs for unlearn stage")
-
-    # 使用当前全局模型的一个拷贝作为遗忘起点
-    unlearn_model = deepcopy(self.model)
-
-    unlearn_trainer = GradDiff(
-        model=unlearn_model,
-        train_dataset=combined_dataset,
-        tokenizer=self.tokenizer,
-        data_collator=self.data_collator,
-        args=unlearn_args,
-        evaluator=self.evaluator,
-        template_args=self.template_args,
-        **self.kwargs,
-    )
-
-    logger.info("Start unlearning training on Client A's data (GradDiff)...")
-    unlearn_trainer.train()
-    logger.info("Unlearning training finished.")
-
-    # 3. 计算当前全局参数与遗忘后模型之间的差值 → 过滤器 F_A
-    if self.is_peft:
-        base_state = get_peft_model_state_dict(self.model.cpu())
-        unlearn_state = get_peft_model_state_dict(unlearn_trainer.model.cpu())
-    else:
-        base_state = self.model.cpu().state_dict()
-        unlearn_state = unlearn_trainer.model.cpu().state_dict()
-
-    self.filter_F_A = {}
-    missing_keys = 0
-    for key, param in base_state.items():
-        if key in unlearn_state and isinstance(param, torch.Tensor):
-            # F_A[key] = Theta^t[key] - Theta_unlearn[key]
-            self.filter_F_A[key] = (param - unlearn_state[key]).detach().clone()
+        # 1. 准备“忘记 + 保留”数据
+        # 如果是 unlearn 模式，client_A_dataset 通常是 ForgetRetainDataset，包含 .forget / .retain
+        if hasattr(client_A_dataset, "forget") and hasattr(client_A_dataset, "retain"):
+            forget_dataset = client_A_dataset.forget
+            retain_dataset = client_A_dataset.retain
+            retain_inner = getattr(retain_dataset, "retain", retain_dataset)
         else:
-            self.filter_F_A[key] = None
-            missing_keys += 1
+            # 否则退化为：全量数据当作 forget，retain 用同一份数据
+            forget_dataset = client_A_dataset
+            retain_inner = client_A_dataset
 
-    if missing_keys > 0:
-        logger.warning(f"{missing_keys} keys in base_state not found in unlearn_state or not Tensor.")
+        class CombinedDataset(Dataset):
+            """
+            简化版 Combine：每个样本同时提供 forget 和 retain，
+            方便直接复用 GradDiff 的 compute_loss 逻辑。
+            """
+            def __init__(self, forget_data, retain_data):
+                self.forget_data = forget_data
+                self.retain_data = retain_data
+                self.retain_len = len(retain_data)
 
-    logger.info("Filter F_A constructed from (Theta^t - Theta_unlearn).")
-    self.revocation_status = True
-    logger.info("RevocationStatus set to True")
+            def __len__(self):
+                return len(self.forget_data)
+
+            def __getitem__(self, idx):
+                retain_idx = idx % self.retain_len
+                return {
+                    "forget": {"forget": self.forget_data[idx]},
+                    "retain": {"retain": self.retain_data[retain_idx]},
+                }
+
+        combined_dataset = CombinedDataset(forget_dataset, retain_inner)
+
+        # 2. 构造一个用于遗忘阶段的 Trainer（GradDiff）
+        unlearn_args = deepcopy(self.args)
+        if self.unlearn_epochs is not None:
+            unlearn_args.num_train_epochs = self.unlearn_epochs
+            logger.info(f"Using {self.unlearn_epochs} epochs for unlearn stage")
+        else:
+            logger.info(f"Using default {unlearn_args.num_train_epochs} epochs for unlearn stage")
+
+        # 使用当前全局模型的一个拷贝作为遗忘起点
+        unlearn_model = deepcopy(self.model)
+
+        unlearn_trainer = GradDiff(
+            model=unlearn_model,
+            train_dataset=combined_dataset,
+            tokenizer=self.tokenizer,
+            data_collator=self.data_collator,
+            args=unlearn_args,
+            evaluator=self.evaluator,
+            template_args=self.template_args,
+            **self.kwargs,
+        )
+
+        logger.info("Start unlearning training on Client A's data (GradDiff)...")
+        unlearn_trainer.train()
+        logger.info("Unlearning training finished.")
+
+        # 3. 计算当前全局参数与遗忘后模型之间的差值 → 过滤器 F_A
+        if self.is_peft:
+            base_state = get_peft_model_state_dict(self.model.cpu())
+            unlearn_state = get_peft_model_state_dict(unlearn_trainer.model.cpu())
+        else:
+            base_state = self.model.cpu().state_dict()
+            unlearn_state = unlearn_trainer.model.cpu().state_dict()
+
+        self.filter_F_A = {}
+        missing_keys = 0
+        for key, param in base_state.items():
+            if key in unlearn_state and isinstance(param, torch.Tensor):
+                # F_A[key] = Theta^t[key] - Theta_unlearn[key]
+                self.filter_F_A[key] = (param - unlearn_state[key]).detach().clone()
+            else:
+                self.filter_F_A[key] = None
+                missing_keys += 1
+
+        if missing_keys > 0:
+            logger.warning(f"{missing_keys} keys in base_state not found in unlearn_state or not Tensor.")
+
+        logger.info("Filter F_A constructed from (Theta^t - Theta_unlearn).")
+        self.revocation_status = True
+        logger.info("RevocationStatus set to True")
 
     def train_client_model(self, client_model, client_dataset):
         """Train client model locally"""
@@ -332,7 +339,7 @@ def _trigger_revocation(self, round_idx: int):
             evaluator=self.evaluator,
             template_args=self.template_args,
         )
-        
+
         trainer.train()
         trained_model = trainer.model.cpu()
         return trained_model
@@ -342,56 +349,64 @@ def _trigger_revocation(self, round_idx: int):
         Secure aggregation with re-alignment for target client B
         """
         logger.info("Aggregating client models with alignment")
-        
+
         total_samples = sum(self.client_data_sizes)
         if total_samples == 0:
             logger.warning("No samples available for aggregation")
             return
-        
+
         client_weights = [size / total_samples for size in self.client_data_sizes]
         logger.info(f"Client sample sizes: {self.client_data_sizes}")
         logger.info(f"Client weights: {[f'{w:.4f}' for w in client_weights]}")
-        
-        # Compute updates and aggregate
-        aggregated_update = {}
-        for key in global_state.keys():
-            aggregated_update[key] = torch.zeros_like(global_state[key])
-        
+
+        # Collect aligned client parameters (not parameter deltas)
+        aligned_client_states = []
         for client_idx in range(self.num_clients):
-            if initial_states[client_idx] is None or updated_states[client_idx] is None:
+            if updated_states[client_idx] is None:
+                # No data for this client; contribute current global state (weight should be ~0)
+                aligned_client_states.append(global_state)
                 continue
-            
-            # Compute update: ΔΘ_k = Θ_k^{new} - Θ_k^{init}
-            client_update = compute_model_update(initial_states[client_idx], updated_states[client_idx])
-            
+
+            client_state = updated_states[client_idx]
+
             # Re-align if this is target client B and revocation is active
             if self.revocation_status and client_idx == self.target_client_idx:
                 if round_idx in self.permutation_keys and client_idx in self.permutation_keys[round_idx]:
-                    logger.info(f"Re-aligning update from target client {client_idx}")
+                    logger.info(f"Re-aligning parameters from target client {client_idx}")
                     perm_key = self.permutation_keys[round_idx][client_idx]
-                    client_update = apply_inverse_permutation(client_update, perm_key)
+                    client_state = apply_inverse_permutation(client_state, perm_key)
                 else:
                     logger.warning(f"No permutation key found for client {client_idx} at round {round_idx}")
-            
-            # Weighted aggregation
-            weight = client_weights[client_idx]
-            for key in aggregated_update.keys():
-                if key in client_update:
-                    aggregated_update[key] += weight * client_update[key]
-        
-        # Update global model: Θ^{t+1} = Θ^t + η · (1/|S_t|) · Δ_agg
-        # Note: The algorithm uses 1/|S_t|, but we're using weighted average, so we adjust
-        num_selected = sum(1 for w in client_weights if w > 0)
-        for key in global_state.keys():
-            if key in aggregated_update:
-                global_state[key] = global_state[key] + self.aggregation_lr * aggregated_update[key]
-        
+
+                # Add back filter so the forget effect is not propagated
+                if self.filter_F_A is not None:
+                    restored_state = {}
+                    for key, tensor in client_state.items():
+                        if not isinstance(tensor, torch.Tensor):
+                            restored_state[key] = tensor
+                            continue
+                        filter_param = self.filter_F_A.get(key)
+                        if filter_param is None:
+                            restored_state[key] = tensor.clone()
+                        else:
+                            restored_state[key] = tensor + self.filter_alpha * filter_param.to(tensor.device)
+                    client_state = restored_state
+
+            aligned_client_states.append(client_state)
+
+        # Aggregate full parameters (FedAvg-style) using client weights
+        aggregated_state = FedAvg(
+            aligned_client_states,
+            global_model_state_dict=global_state,
+            client_weights=client_weights,
+        )
+
         # Load updated global state
         if self.is_peft:
-            set_peft_model_state_dict(self.model, global_state)
+            set_peft_model_state_dict(self.model, aggregated_state)
         else:
-            self.model.load_state_dict(global_state)
-        
+            self.model.load_state_dict(aggregated_state)
+
         logger.info("Global model updated with aligned aggregations")
 
     def trigger_revocation(self):
@@ -402,18 +417,16 @@ def _trigger_revocation(self, round_idx: int):
         if self.revocation_status:
             logger.warning("Revocation already active")
             return
-        
-        # Trigger at next round (we'll handle this in train loop)
-        # For immediate trigger, we can set a flag
+
         self._should_trigger_revocation = True
 
     def save_model(self, output_dir=None):
         """Save model with FedPerm state"""
         if output_dir is None:
             output_dir = self.args.output_dir
-        
+
         os.makedirs(output_dir, exist_ok=True)
-        
+
         if self.is_peft:
             logger.info(f"Saving PEFT model to {output_dir}")
             self.model.save_pretrained(output_dir)
@@ -421,7 +434,7 @@ def _trigger_revocation(self, round_idx: int):
                 self.tokenizer.save_pretrained(output_dir)
         else:
             super().save_model(output_dir)
-        
+
         # Save FedPerm specific state
         perm_state = {
             'revocation_status': self.revocation_status,
@@ -430,3 +443,12 @@ def _trigger_revocation(self, round_idx: int):
         }
         torch.save(perm_state, os.path.join(output_dir, 'fedperm_state.pt'))
         logger.info(f"FedPerm state saved to {output_dir}")
+
+    def _is_adapter_parameter(self, name: str, param: torch.Tensor) -> bool:
+        """
+        Determine whether a parameter belongs to adapter modules (e.g., LoRA)
+        and is eligible for permutation.
+        """
+        if not self.is_peft or not isinstance(param, torch.Tensor):
+            return False
+        return "lora" in name.lower()

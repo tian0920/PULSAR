@@ -6,9 +6,9 @@ FINETUNE_EXP=finetune/tofu/default.yaml
 EVAL_EXP=eval/tofu/default.yaml
 SEED=42
 
-FORGET_SPLIT=forget_0
-RETAIN_SPLIT=retain_0
-HOLDOUT_SPLIT=holdout_0
+FORGET_SPLIT=forget10
+RETAIN_SPLIT=retain90
+HOLDOUT_SPLIT=holdout10
 
 RETAIN_TASK_NAME=retain_tofu
 FEDAVG_TASK_NAME=fedavg_tofu

@@ -27,6 +27,11 @@ def _register_trainer(trainer_class):
     TRAINER_REGISTRY[trainer_class.__name__] = trainer_class
 
 
+CUSTOM_TRAINER_ARG_KEYS = [
+    "unlearn_epochs",
+]
+
+
 def load_trainer_args(trainer_args: DictConfig, dataset):
     trainer_args = dict(trainer_args)
     warmup_epochs = trainer_args.pop("warmup_epochs", None)
@@ -40,8 +45,13 @@ def load_trainer_args(trainer_args: DictConfig, dataset):
             // (batch_size * grad_accum_steps * num_devices)
         )
 
+    custom_args = {}
+    for key in CUSTOM_TRAINER_ARG_KEYS:
+        if key in trainer_args:
+            custom_args[key] = trainer_args.pop(key)
+
     trainer_args = TrainingArguments(**trainer_args)
-    return trainer_args
+    return trainer_args, custom_args
 
 
 def load_trainer(
@@ -54,9 +64,16 @@ def load_trainer(
     evaluator=None,
     template_args=None,
 ):
-    trainer_args = trainer_cfg.args
-    method_args = trainer_cfg.get("method_args", {})
-    trainer_args = load_trainer_args(trainer_args, train_dataset)
+    trainer_args_cfg = trainer_cfg.args
+    method_args_cfg = trainer_cfg.get("method_args", {})
+
+    trainer_args, custom_args = load_trainer_args(trainer_args_cfg, train_dataset)
+
+    method_args = dict(method_args_cfg) if method_args_cfg else {}
+    for key, value in custom_args.items():
+        if value is not None:
+            method_args[key] = value
+
     trainer_handler_name = trainer_cfg.get("handler")
     assert trainer_handler_name is not None, ValueError(
         f"{trainer_handler_name} handler not set"

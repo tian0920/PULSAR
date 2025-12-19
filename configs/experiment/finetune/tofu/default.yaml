@@ -12,7 +12,7 @@ trainer:
     learning_rate: 8e-5
     weight_decay: 0.01
     warmup_epochs: 1.0 # custom parameter
-    num_train_epochs: 10
+    num_train_epochs: 1
 
 
 forget_split: forget10

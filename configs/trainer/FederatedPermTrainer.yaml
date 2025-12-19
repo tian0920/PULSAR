@@ -1,14 +1,14 @@
 handler: FederatedPermTrainer
 method_args:
-  num_clients: 5
+  num_clients: 3
   target_client_idx: 1
   revoker_client_idx: 0
   aggregation_strategy: "FedAvg"
-  global_rounds: 10
+  global_rounds: 2
   filter_alpha: 1.0
   aggregation_lr: 1.0
   enable_revocation: true
-  revocation_round: 3
+  revocation_round: 1
 args:
   output_dir: "output/fedperm"
   seed: 42
