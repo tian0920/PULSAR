@@ -15,11 +15,26 @@ class QADataset(Dataset):
         few_shot_dataset_hf_args=None,
         max_length=512,
         predict_with_generate=False,
+        indices=None,
+        indices_path=None,
     ):
         super(QADataset, self).__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.data = load_hf_dataset(**hf_args)
+        # Optional subsetting by indices (supports list passed directly or via json file)
+        if indices is None and indices_path is not None:
+            import json
+
+            with open(indices_path, "r") as f:
+                indices_obj = json.load(f)
+                if isinstance(indices_obj, dict) and "forget_indices" in indices_obj:
+                    indices = indices_obj["forget_indices"]
+                else:
+                    indices = indices_obj
+        if indices is not None:
+            # HuggingFace Dataset supports select with a list of indices
+            self.data = self.data.select(indices)
         self.data = add_dataset_index(self.data)
         self.fs_data = None
         if few_shot_dataset_hf_args is not None:

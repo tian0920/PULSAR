@@ -7,32 +7,69 @@ from typing import List, Dict, Optional, Union, Tuple, Callable
 logger = logging.getLogger(__name__)
 
 
+def _should_permute(name: str, param: torch.Tensor, predicate: Optional[Callable[[str, torch.Tensor], bool]]) -> bool:
+    if not isinstance(param, torch.Tensor) or param.numel() == 0:
+        return False
+    if predicate is not None and not predicate(name, param):
+        return False
+    # 输入 / 输出层禁止置换：常见命名包含 embed / embedding / lm_head / output
+    lowered = name.lower()
+    if any(tag in lowered for tag in ["embed", "embedding", "lm_head", "output"]):
+        return False
+    # 标量或空形状不置换
+    if param.dim() == 0:
+        return False
+    return True
+
+
+def _permute_tensor(param: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
+    if param.dim() == 1:
+        return param[perm]
+    # 仅在第 0 维（神经元维度）上置换，保持层内结构
+    reshaped = param.reshape(param.shape[0], -1)
+    permuted = reshaped[perm]
+    return permuted.reshape(param.shape)
+
+
 def generate_permutation_key(
     state_dict: Dict[str, torch.Tensor],
     seed: Optional[int] = None,
     predicate: Optional[Callable[[str, torch.Tensor], bool]] = None,
 ) -> Dict[str, Optional[torch.Tensor]]:
-    """Generate a reproducible random permutation for tensor parameters passing predicate."""
+    """
+    生成按层（参数名前缀）共享的神经元置换键：
+    - 仅沿第 0 维置换，同层内交换，不跨层；
+    - 输入/输出层（embed/embedding/lm_head/output）跳过。
+    - weight/bias 共享同一前缀的置换键，保持一致。
+    """
     generator = torch.Generator()
     if seed is None:
         seed = torch.seed()
     generator.manual_seed(seed)
 
     permutation_key: Dict[str, Optional[torch.Tensor]] = {}
+    prefix_cache: Dict[str, torch.Tensor] = {}
+
     for name, param in state_dict.items():
-        if not isinstance(param, torch.Tensor) or param.numel() == 0:
+        if not _should_permute(name, param, predicate):
             permutation_key[name] = None
             continue
-        if predicate is not None and not predicate(name, param):
-            permutation_key[name] = None
+
+        # weight/bias 等前缀共享同一置换，避免同层参数错位
+        base_name = name.rsplit(".", 1)[0] if "." in name else name
+        if base_name in prefix_cache:
+            permutation_key[name] = prefix_cache[base_name]
             continue
-        perm = torch.randperm(param.numel(), generator=generator)
+
+        perm = torch.randperm(param.shape[0], generator=generator)
+        prefix_cache[base_name] = perm
         permutation_key[name] = perm
+
     return permutation_key
 
 
 def apply_permutation(state_dict: Dict[str, torch.Tensor], permutation_key: Dict[str, Optional[torch.Tensor]]):
-    """Apply a stored permutation key to each tensor parameter."""
+    """Apply stored permutation along第0维，仅对有置换键的参数生效。"""
     permuted_state: Dict[str, torch.Tensor] = {}
     for name, param in state_dict.items():
         if not isinstance(param, torch.Tensor):
@@ -42,15 +79,13 @@ def apply_permutation(state_dict: Dict[str, torch.Tensor], permutation_key: Dict
         if perm is None:
             permuted_state[name] = param.clone()
             continue
-        flat = param.view(-1)
         device_perm = perm.to(param.device)
-        permuted_flat = flat[device_perm]
-        permuted_state[name] = permuted_flat.view_as(param)
+        permuted_state[name] = _permute_tensor(param, device_perm)
     return permuted_state
 
 
 def apply_inverse_permutation(state_dict: Dict[str, torch.Tensor], permutation_key: Dict[str, Optional[torch.Tensor]]):
-    """Revert a permutation using its key."""
+    """Revert permutation along第0维，使用对应的置换键。"""
     restored_state: Dict[str, torch.Tensor] = {}
     for name, param in state_dict.items():
         if not isinstance(param, torch.Tensor):
@@ -62,10 +97,13 @@ def apply_inverse_permutation(state_dict: Dict[str, torch.Tensor], permutation_k
             continue
         inverse = torch.empty_like(perm)
         inverse[perm] = torch.arange(perm.numel(), device=perm.device)
-        flat = param.view(-1)
         device_inverse = inverse.to(param.device)
-        restored_flat = flat[device_inverse]
-        restored_state[name] = restored_flat.view_as(param)
+        if param.dim() == 1:
+            restored_state[name] = param[device_inverse]
+        else:
+            reshaped = param.reshape(param.shape[0], -1)
+            restored = reshaped[device_inverse].reshape(param.shape)
+            restored_state[name] = restored
     return restored_state
 
 

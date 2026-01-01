@@ -22,4 +22,6 @@ output_dir: ${paths.output_dir} # set to default eval directory
 metrics: {}
 overwrite: false
 data_split: News
+forget_split: null
+forget_indices_path: null
 retain_logs_path: null

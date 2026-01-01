@@ -4,6 +4,8 @@ defaults:
   - override /model: Llama-2-7b-hf
   - override /eval: muse
 
+forget_split: forget
+holdout_split: holdout1
 data_split: News
 retain_logs_path: null
 
@@ -13,6 +15,9 @@ model:
 
 eval:
   muse:
+    forget_split: ${forget_split}
+    forget_indices_path: null
+    holdout_split: ${holdout_split}
     data_split: ${data_split}
     retain_logs_path: ${retain_logs_path}
   

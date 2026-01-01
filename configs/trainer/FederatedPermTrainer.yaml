@@ -1,14 +1,36 @@
 handler: FederatedPermTrainer
+# 目标客户端索引，默认 1，可在命令行/脚本中覆盖
 method_args:
   num_clients: 3
   target_client_idx: 1
   revoker_client_idx: 0
+  unlearn_trainer_cls: "GradDiff"
+  train_on: "full"  # full / retain / forget
+  unlearn_epochs: 1        # 过滤器 / 遗忘阶段的专用 epoch 数
+  retain_split_name: null
+  forget_split_name: null
+  assign_forget_to_revoker_only: false  # 新增划分：retain 均分，各客户端；forget 全部给 revoker（用于过滤器与 forget_utility 评测）
   aggregation_strategy: "FedAvg"
-  global_rounds: 2
-  filter_alpha: 1.0
+  global_rounds: 10
+  filter_alpha: 0.5
   aggregation_lr: 1.0
   enable_revocation: true
-  revocation_round: 1
+  normal_rounds_before_forget: 4
+  forget_round_count: 3
+  recovery_round_start: 7
+  eval_client_c_idx: -1  # Which client to use for C-side eval; -1 to skip
+  save_client_splits_for_eval: false  # Save split indices for client-level forget eval
+  retain_indices_path: null           # Optional: reuse precomputed retain indices
+  forget_indices_path: null           # Optional: reuse precomputed forget indices
+  global_retain_indices: null         # Optional: pass merged retain indices
+  global_forget_indices: null         # Optional: pass merged forget indices
+  # 可选：目标客户端 B 的锚点正则（约束遗忘后回弹），默认关闭
+  target_anchor_reg_enabled: false
+  target_anchor_reg_lambda: 0.0
+  # 可选：目标客户端 B 遗忘阶段附加上一轮 CE 监督
+  target_prev_ce_enabled: false
+  target_prev_ce_weight: 1.0
+  prev_target_model_path: null
 args:
   output_dir: "output/fedperm"
   seed: 42
@@ -23,4 +45,3 @@ args:
   logging_steps: 50
   save_strategy: "epoch"
   fp16: true
-  unlearn_epochs: 1        # 过滤器 / 遗忘阶段的专用 epoch 数

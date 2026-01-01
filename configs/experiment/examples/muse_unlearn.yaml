@@ -119,60 +119,6 @@ eval:
         handler: rouge
         rouge_type: rougeL_f1
         batch_size: 16
-      privleak:
-        pre_compute:
-          forget_minKpc_neg_logprob:
-            datasets:
-              MUSE_forget_privleak:
-                handler: PretrainingDataset
-                args:
-                  hf_args:
-                    path: muse-bench/MUSE-${eval.muse.data_split}
-                    name: privleak
-                    split: forget
-                  prefix_key: prompt
-                  text_key: text
-            collators:
-              DataCollatorForSupervisedDataset:
-                handler: DataCollatorForSupervisedDataset
-                args:
-                  padding_side: right
-                  index: index
-            handler: minKpc_negative_logprob
-            batch_size: 8
-            k: 0.4
-            access_key: forget
-          holdout_minKpc_neg_logprob:
-            datasets:
-              MUSE_holdout_privleak:
-                handler: PretrainingDataset
-                args:
-                  hf_args:
-                    path: muse-bench/MUSE-${eval.muse.data_split}
-                    name: privleak
-                    split: holdout
-                  prefix_key: prompt
-                  text_key: text
-            collators:
-              DataCollatorForSupervisedDataset:
-                handler: DataCollatorForSupervisedDataset
-                args:
-                  padding_side: right
-                  index: index
-            handler: minKpc_negative_logprob
-            batch_size: 8
-            k: 0.4
-            access_key: holdout
-        reference_logs:
-          retain_model_logs:
-            path: ${eval.muse.retain_logs_path}
-            include:
-              forget_minKpc_neg_logprob:
-                access_key: retain
-              holdout_minKpc_neg_logprob:
-                access_key: holdout
-        handler: privleak
-        ref_value: 0.5
     handler: MUSEEvaluator
     device: cuda
     output_dir: ${paths.output_dir}

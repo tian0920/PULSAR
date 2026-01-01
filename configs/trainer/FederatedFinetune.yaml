@@ -3,6 +3,14 @@ method_args:
   num_clients: 3  # Total number of clients in federated learning
   aggregation_strategy: "FedAvg"  # FedAvg, FedAdam, FedYogi, FedAdagrad, FedAvgM
   global_rounds: 2  # Total number of global training rounds
+  retain_ratio: 0.99  # Portion of data to retain when sampling retain/forget splits
+  train_on: "full"  # Which split to train on: full / retain / forget
+  retain_split_name: null
+  forget_split_name: null
+  unlearn_epochs: null  # 占位以兼容脚本覆写（FedPerm 场景可忽略）
+  save_client_splits_for_eval: false  # Save split indices for client-level forget eval
+  assign_forget_to_revoker_only: false  # 将 forget 全部分配给 revoker(A)，retain 均分
+  revoker_client_idx: 0  # revoker(A) 索引；配合 assign_forget_to_revoker_only 使用
 
 args:
   output_dir: saves/finetune/${task_name}

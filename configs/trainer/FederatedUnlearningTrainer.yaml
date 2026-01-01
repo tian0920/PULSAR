@@ -1,8 +1,9 @@
 handler: FederatedUnlearningTrainer
+# 目标客户端索引，便于在命令行/脚本里统一覆盖
 method_args:
   num_clients: 3
-  target_client_idx: 0
-  unlearn_trainer_cls: "SimNPO"
+  target_client_idx: 1
+  unlearn_trainer_cls: "GradAscent"
   aggregation_strategy: "FedAdam"  # FedAvg, FedAdam, FedYogi, FedAdagrad, FedAvgM
   global_rounds: 2  # Total number of global training rounds
   unlearn_epochs: 50  # Unlearning phase specific epoch settings
@@ -30,4 +31,3 @@ args:
   eval_strategy: 'no'
   num_train_epochs: 5  # Fine-tuning phase specific epoch settings
   seed: 0
-

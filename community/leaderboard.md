@@ -95,18 +95,16 @@ To implement a new method, refer to our [contributing guide](../docs/contributin
   <thead>
     <tr>
       <th style="text-align: center;">Method</th>
-      <th style="text-align: center;" colspan="4" halign="left">News</th>
-      <th style="text-align: center;" colspan="4" halign="left">Books</th>
+      <th style="text-align: center;" colspan="3" halign="left">News</th>
+      <th style="text-align: center;" colspan="3" halign="left">Books</th>
     </tr>
     <tr>
       <th></th>
       <th>forget_knowmem_ROUGE</th>
       <th>forget_verbmem_ROUGE</th>
-      <th>privleak</th>
       <th>retain_knowmem_ROUGE</th>
       <th>forget_knowmem_ROUGE</th>
       <th>forget_verbmem_ROUGE</th>
-      <th>privleak</th>
       <th>retain_knowmem_ROUGE</th>
     </tr>
   </thead>
@@ -115,22 +113,18 @@ To implement a new method, refer to our [contributing guide](../docs/contributin
       <th>Finetuned</th>
       <td>0.64</td>
       <td>0.58</td>
-      <td>-99.81</td>
       <td>0.56</td>
       <td>0.47</td>
       <td>1.0</td>
-      <td>-57.34</td>
       <td>0.69</td>
     </tr>
     <tr>
       <th>Retain</th>
       <td>0.33</td>
       <td>0.20</td>
-      <td>0</td>
       <td>0.56</td>
       <td>0.3</td>
       <td>0.14</td>
-      <td>0</td>
       <td>0.69</td>
     </tr>
     <tr>

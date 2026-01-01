@@ -44,6 +44,12 @@ def get_model(model_cfg: DictConfig):
     use_lora = model_args.get("use_lora", False)
     lora_config = model_args.get("lora_config", None)
     lora_model_path = model_args.get("lora_model_path", None)
+    
+    # Check if pretrained_model_name_or_path is a local path containing LoRA adapter
+    pretrained_path = model_args.pretrained_model_name_or_path
+    is_local_path = os.path.exists(pretrained_path) if isinstance(pretrained_path, str) else False
+    adapter_config_path = os.path.join(pretrained_path, "adapter_config.json") if is_local_path else None
+    has_adapter = adapter_config_path and os.path.exists(adapter_config_path) if adapter_config_path else False
 
     try:
         # Convert DictConfig to dict for transformersAdd commentMore actions
@@ -54,13 +60,37 @@ def get_model(model_cfg: DictConfig):
             "cache_dir": hf_home
         }
         
+        # Priority 1: Explicit lora_model_path
         if lora_model_path:
             # Load existing PEFT model
             logger.info(f"Loading existing PEFT model from {lora_model_path}")
             model = PeftModel.from_pretrained(
                 AutoModelForCausalLM.from_pretrained(**transformers_args),
-                lora_model_path
+                lora_model_path,
+                is_trainable=True,  # ensure LoRA adapters remain trainable
             )
+        # Priority 2: Local path contains LoRA adapter (for evaluation)
+        elif has_adapter:
+            # Load base model from tokenizer_args or model config
+            base_model_path = tokenizer_args.get("pretrained_model_name_or_path", None)
+            if not base_model_path:
+                # Try to get from model config defaults or use a default
+                base_model_path = "meta-llama/Llama-3.2-1B-Instruct"  # Default fallback
+                logger.warning(f"Base model path not found, using default: {base_model_path}")
+            
+            logger.info(f"Detected LoRA adapter at {pretrained_path}, loading base model from {base_model_path}")
+            base_transformers_args = {
+                "torch_dtype": torch_dtype,
+                "pretrained_model_name_or_path": base_model_path,
+                "trust_remote_code": model_args.get("trust_remote_code", True),
+                "cache_dir": hf_home
+            }
+            base_model = AutoModelForCausalLM.from_pretrained(**base_transformers_args)
+            model = PeftModel.from_pretrained(
+                base_model, pretrained_path, is_trainable=True
+            )
+            logger.info(f"Successfully loaded LoRA adapter from {pretrained_path}")
+        # Priority 3: Create new LoRA model
         elif use_lora:
             # Create new LoRA model
             logger.info("Creating new LoRA model")

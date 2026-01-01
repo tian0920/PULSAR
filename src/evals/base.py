@@ -51,11 +51,13 @@ class Evaluator:
         return metrics
 
     def summarize(self, logs):
-        """Summarize the metrics results"""
+        """Summarize the metrics results.
+
+        按日志中出现的所有指标写入 summary，只要带有 agg_value 就保留，
+        避免漏掉配置之外的指标（如 forget_Truth_Ratio 等）。
+        """
         metric_summary = {}
         for metric_name, metric_results in logs.items():
-            if metric_name not in self.metrics:
-                continue
             agg_value = metric_results.get("agg_value", None)
             if agg_value is not None:
                 metric_summary[metric_name] = agg_value

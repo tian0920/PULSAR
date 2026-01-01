@@ -33,6 +33,20 @@ def compute_kl_divergence(model, target_model, inputs):
 
 
 def compute_batch_nll(model, inputs):
+    """
+    Safe NLL that clamps token ids to vocab range to avoid CUDA device-side asserts.
+    """
+    vocab_size = getattr(model.config, "vocab_size", None)
+    if vocab_size is not None and "input_ids" in inputs:
+        input_ids = inputs["input_ids"]
+        bad = (input_ids < 0) | (input_ids >= vocab_size)
+        if bad.any():
+            pad_id = getattr(getattr(model, "tokenizer", None), "pad_token_id", None)
+            fill_val = pad_id if pad_id is not None else vocab_size - 1
+            input_ids = input_ids.clone()
+            input_ids[bad] = fill_val
+            inputs = dict(inputs)
+            inputs["input_ids"] = input_ids
     # get the sum loss for each sequence in a batch
     # NOTE: not same as model(**inputs).loss but has sum loss for each seq in a batch
     outputs = model(**inputs)

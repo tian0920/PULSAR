@@ -8,3 +8,4 @@ TOFU_QA_retain_eval:
     question_key: "question"
     answer_key: "answer"
     max_length: 512
+    indices_path: ${eval.tofu.retain_indices_path}

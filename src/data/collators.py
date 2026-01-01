@@ -67,4 +67,33 @@ class DataCollatorForSupervisedDataset(object):
                     )
                 else:
                     raise Warning(f"{self.index} not found in dataset")
+        # Sanity check: clamp out-of-range ids to avoid CUDA device-side asserts
+        vocab_size = getattr(self.tokenizer, "vocab_size", None)
+
+        def _sanitize(dct):
+            if vocab_size is None or "input_ids" not in dct:
+                return
+            dct["input_ids"] = dct["input_ids"].long()
+            bad_ids = (dct["input_ids"] < 0) | (dct["input_ids"] >= vocab_size)
+            if bad_ids.any():
+                fill_val = (
+                    self.tokenizer.pad_token_id
+                    if self.tokenizer.pad_token_id is not None
+                    else vocab_size - 1
+                )
+                dct["input_ids"][bad_ids] = fill_val
+            if "labels" in dct:
+                bad_labels = (dct["labels"] != IGNORE_INDEX) & (
+                    (dct["labels"] < 0) | (dct["labels"] >= vocab_size)
+                )
+                if bad_labels.any():
+                    dct["labels"][bad_labels] = IGNORE_INDEX
+
+        if "input_ids" in return_dct:
+            _sanitize(return_dct)
+        else:
+            # Nested dict case: apply to sub-dicts
+            for v in return_dct.values():
+                if isinstance(v, dict):
+                    _sanitize(v)
         return return_dct

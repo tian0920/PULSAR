@@ -8,3 +8,4 @@ TOFU_QA_retain_pert:
     question_key: "question"
     answer_key: "perturbed_answer"
     max_length: 512
+    indices_path: ${eval.tofu.retain_indices_path}
