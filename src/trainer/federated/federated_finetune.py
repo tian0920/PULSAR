@@ -2,6 +2,7 @@ import torch
 import logging
 from copy import deepcopy
 from typing import Dict, List, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from trainer.base import FinetuneTrainer
 from torch.utils.data import Dataset
@@ -55,6 +56,12 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         self.client_models = []
         self.client_data_sizes = []  
         self.kwargs = kwargs
+
+        # 并行配置：默认使用可用 GPU 数，可通过 method_args.client_parallelism / FEDPERM_CLIENT_DEVICES 覆盖
+        default_parallelism = torch.cuda.device_count() or 1
+        self.client_parallelism = max(1, int(kwargs.get("client_parallelism", default_parallelism)))
+        device_override = kwargs.get("client_devices", None) or os.environ.get("FEDPERM_CLIENT_DEVICES", None)
+        self.client_devices = self._parse_client_devices(device_override)
         
 
         self.is_peft = isinstance(self.model, PeftModel)
@@ -118,6 +125,7 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
 
             logger.info(f"Aggregation strategy: {self.aggregation_strategy}")
 
+            training_tasks = []
             for client_idx in range(self.num_clients):
                 if client_idx not in self.federated_dataset:
                     logger.warning(f"Skipping client {client_idx} as no data is available")
@@ -144,20 +152,38 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                         stage=stage_name,
                     )
 
-                logger.info(f"Training on client {client_idx}")
-                logger.info(f"Client {client_idx} dataset size: {client_data_size} samples")
-                logger.info(f"Training args - Batch size: {self.args.per_device_train_batch_size}, Epochs: {self.args.num_train_epochs}")
-                if hasattr(self.args, 'max_steps') and self.args.max_steps > 0:
-                    logger.info(f"Max steps limit: {self.args.max_steps}")
-                
-                trained_client_model = self.train_client_model(client_model, client_dataset)
-                
-         
-                self.client_models[client_idx] = trained_client_model
-                
-                # self.trained_client_indices.append(client_idx)
+                # 收集并行训练任务
+                training_tasks.append(
+                    (
+                        client_idx,
+                        client_model,
+                        client_dataset,
+                        self._device_for_client(client_idx),
+                    )
+                )
 
-                # Client-side eval after local training
+            max_workers = max(1, min(self.client_parallelism, len(self.client_devices)))
+            logger.info(f"Launching client training with up to {max_workers} workers over devices {self.client_devices}")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        self._train_client_task,
+                        idx,
+                        model,
+                        dataset,
+                        device,
+                    )
+                    for (idx, model, dataset, device) in training_tasks
+                ]
+                for future in as_completed(futures):
+                    client_idx, trained_client_model = future.result()
+                    self.client_models[client_idx] = trained_client_model
+
+            # Client-side eval after local training（串行以避免 evaluator 并发冲突）
+            for client_idx in range(self.num_clients):
+                trained_client_model = self.client_models[client_idx] if client_idx < len(self.client_models) else None
+                if trained_client_model is None:
+                    continue
                 self._maybe_evaluate_model(
                     model=trained_client_model,
                     round_idx=round_idx,
@@ -186,12 +212,17 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         self.save_state()
         return None
 
-    def train_client_model(self, client_model, client_dataset):
+    def train_client_model(self, client_model, client_dataset, device=None):
         # Move client model to GPU if available (Trainer will handle device placement, but we ensure it's on GPU)
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-            client_model = client_model.to(device)
-            logger.info(f"Client model moved to GPU device: {device}")
+        target_device = None
+        if device is not None:
+            target_device = device if isinstance(device, torch.device) else torch.device(device)
+        elif torch.cuda.is_available():
+            target_device = torch.device("cuda")
+        if target_device is not None and target_device.type == "cuda":
+            torch.cuda.set_device(target_device)
+            client_model = client_model.to(target_device)
+            logger.info(f"Client model moved to device: {target_device}")
 
         if self.aggregation_strategy == "FedProx":
             
@@ -254,7 +285,55 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         
 
         trained_model = trainer.model.cpu()
+        if target_device is not None and target_device.type == "cuda":
+            torch.cuda.empty_cache()
         return trained_model
+
+    def _parse_client_devices(self, device_spec: Optional[str]) -> List[torch.device]:
+        """
+        返回可用设备列表；默认使用所有 GPU，若无 GPU 则仅 CPU。
+        device_spec 可为逗号分隔的 GPU 编号（如 "0,1"）。
+        """
+        if not torch.cuda.is_available():
+            return [torch.device("cpu")]
+        if device_spec:
+            devices = []
+            for part in str(device_spec).split(","):
+                part = part.strip()
+                if part == "":
+                    continue
+                try:
+                    idx = int(part)
+                    if idx < torch.cuda.device_count():
+                        devices.append(torch.device(f"cuda:{idx}"))
+                except ValueError:
+                    logger.warning(f"Invalid device id in FEDPERM_CLIENT_DEVICES: {part}")
+            if devices:
+                return devices
+        return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+
+    def _device_for_client(self, client_idx: int) -> torch.device:
+        pool = self.client_devices or [torch.device("cpu")]
+        return pool[client_idx % len(pool)]
+
+    def _train_client_task(
+        self,
+        client_idx: int,
+        client_model,
+        client_dataset,
+        device: torch.device,
+    ):
+        logger.info(f"Training on client {client_idx}")
+        logger.info(f"Client {client_idx} dataset size: {len(client_dataset) if client_dataset is not None else 0} samples")
+        logger.info(f"Training args - Batch size: {self.args.per_device_train_batch_size}, Epochs: {self.args.num_train_epochs}")
+        if hasattr(self.args, 'max_steps') and self.args.max_steps > 0:
+            logger.info(f"Max steps limit: {self.args.max_steps}")
+        trained_client_model = self.train_client_model(
+            client_model,
+            client_dataset,
+            device=device,
+        )
+        return client_idx, trained_client_model
 
     def _maybe_evaluate_model(self, model, round_idx: int, stage: str):
         """

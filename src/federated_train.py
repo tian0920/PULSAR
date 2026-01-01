@@ -103,6 +103,13 @@ def main(cfg: DictConfig):
             if handler == "qa":
                 hf_args.setdefault("name", split_name)
                 hf_args.setdefault("path", "locuslab/TOFU")
+                # TOFU 数据集的 retain/forget/holdout 均在 train split 下，通过 name 区分
+                tofu_like = split_name and (
+                    split_name.startswith(("retain", "forget", "holdout"))
+                    or split_name == "full"
+                )
+                if tofu_like and hf_args.get("split") == split_name:
+                    hf_args["split"] = "train"
                 return QADataset(
                     hf_args=hf_args,
                     template_args=template_args,
