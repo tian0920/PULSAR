@@ -181,6 +181,5 @@ cython_debug/
 # Visual Studio Code
 .vscode/logs/
 saves/
-results
+results/
 logs/
-saves/

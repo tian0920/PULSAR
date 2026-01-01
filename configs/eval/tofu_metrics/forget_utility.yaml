@@ -1,0 +1,9 @@
+# @package eval.tofu.metrics.forget_utility
+defaults:
+  - .@pre_compute.forget_Q_A_Prob: forget_Q_A_Prob
+  - .@pre_compute.forget_Q_A_PERT_Prob: forget_Q_A_PERT_Prob
+  - .@pre_compute.forget_Q_A_PARA_Prob: forget_Q_A_PARA_Prob
+  - .@pre_compute.forget_Q_A_ROUGE: forget_Q_A_ROUGE
+  - .@pre_compute.forget_Truth_Ratio: forget_Truth_Ratio
+
+handler: hm_aggregate
