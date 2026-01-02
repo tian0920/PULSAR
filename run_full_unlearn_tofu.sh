@@ -55,7 +55,7 @@ FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
 RETAIN_SPLITS=("retain90")
 USE_CLIENT_FORGET_EVAL=true   # forget_utility 是否用源客户端的 forget indices
-ASSIGN_FORGET_TO_REVOKER_ONLY=false   # 数据集划分方式
+ASSIGN_FORGET_TO_REVOKER_ONLY=true   # 数据集划分方式
 if [ "${ASSIGN_FORGET_TO_REVOKER_ONLY}" = "true" ]; then
   LOG_ROOT="logs/TOFU/fedperm_only"
   OUT_ROOT="saves/TOFU/fedperm_only"
@@ -70,7 +70,7 @@ CLIENT_C_IDX=2
 ENABLE_PERMUTATION=false    # 神经元转置
 
 # full 阶段
-FULL_GLOBAL_ROUNDS=5
+FULL_GLOBAL_ROUNDS=3
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存，1 表示间隔一轮保存（1,3,5...），以此类推
 
 # 遗忘+恢复阶段（沿用 run_fedperm_only 的编排）
@@ -219,12 +219,22 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
 
       echo ">>> SPLITS retain=${RETAIN_SPLIT} forget=${FORGET_SPLIT} holdout=${HOLDOUT_SPLIT}"
 
-      # 共享的客户端划分目录，确保 retain/full/unlearn 三阶段一致
-      COMMON_SPLIT_DIR="saves/TOFU/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
+      # 唯一划分目录，按 ASSIGN_FORGET_TO_REVOKER_ONLY 区分：fedperm / fedperm_only
+      COMMON_SPLIT_DIR="${OUT_ROOT}/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
       mkdir -p "${COMMON_SPLIT_DIR}"
       export FEDPERM_SPLIT_DIR="${COMMON_SPLIT_DIR}"
       RETAIN_IDX_FILE="${COMMON_SPLIT_DIR}/global_retain_indices.json"
       FORGET_IDX_FILE="${COMMON_SPLIT_DIR}/global_forget_indices.json"
+      SPLITS_READY=false
+      if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
+        SPLITS_READY=true
+        echo "Found existing global indices, reuse: ${COMMON_SPLIT_DIR}"
+      fi
+      SPLITS_READY=false
+      if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
+        SPLITS_READY=true
+        echo "Found existing global indices, reuse: ${COMMON_SPLIT_DIR}"
+      fi
 
       ########################################
       # 阶段 1：full 数据联邦训练（只保留最后一轮评测）
@@ -232,13 +242,14 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       SAVE_INTERVAL=${FULL_SAVE_INTERVAL}
       FULL_TASK="full_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}"
       FULL_DIR="${OUT_ROOT}/${FULL_TASK}"
-      CLIENT_SPLIT_DIR="saves/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
+      CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
       mkdir -p "${FULL_DIR}"
 
       if training_complete "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}"; then
         echo "Skip full training, final round exists: ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}"
       else
         EXTRA_EVAL_ARGS=()
+        SAVE_SPLITS_FOR_EVAL=true
         if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
           EXTRA_EVAL_ARGS+=(
             eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
@@ -246,7 +257,8 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           )
         fi
         # 若公共划分已存在，直接复用，不再生成新划分
-        if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
+        if [ "${SPLITS_READY}" = true ]; then
+          SAVE_SPLITS_FOR_EVAL=false
           EXTRA_EVAL_ARGS+=(
             +trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}"
             +trainer.method_args.forget_indices_path="${FORGET_IDX_FILE}"
@@ -268,7 +280,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.method_args.train_on="full" \
           trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \
           trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
-          trainer.method_args.save_client_splits_for_eval=true \
+          trainer.method_args.save_client_splits_for_eval="${SAVE_SPLITS_FOR_EVAL}" \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
           trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
           trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
@@ -283,6 +295,9 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.args.seed="${SEED}" \
           "${EXTRA_EVAL_ARGS[@]}" \
           2>&1 | tee "${LOG_ROOT}/${FULL_TASK}.txt"
+        if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
+          SPLITS_READY=true
+        fi
       fi
 
       # 预留 full 阶段最后一轮的 server pre（用于遗忘阶段 filter 基线），避免后续裁剪被删除
@@ -294,7 +309,8 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         if [ -d "${PRE_BASE_SRC}" ] && [ ! -d "${FILTER_BASE_DIR}" ]; then
           echo "Preserve filter base from ${PRE_BASE_SRC} to ${FILTER_BASE_DIR}"
           mkdir -p "${FILTER_BASE_DIR}"
-          cp -r "${PRE_BASE_SRC}" "${FILTER_BASE_DIR}"
+          # 仅拷贝内容，避免产生 round_x 嵌套目录
+          cp -r "${PRE_BASE_SRC}/." "${FILTER_BASE_DIR}/"
         fi
       fi
 
@@ -303,12 +319,13 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       SAVE_INTERVAL=${FULL_SAVE_INTERVAL}
 
       eval_final_round "${FULL_DIR}" "${FULL_TASK}"
-      # 对齐并冻结客户端划分，生成全局 retain/forget 索引
-      sync_client_splits "${COMMON_SPLIT_DIR}"
-
       ########################################
       # 阶段 2：基于 full 模型的 FedPerm 遗忘 + 恢复（每轮评测）
       ########################################
+      if [ "${SPLITS_READY}" != true ]; then
+        echo "缺少公共划分文件：${COMMON_SPLIT_DIR}，请先生成全局索引后再运行遗忘阶段。" >&2
+        exit 1
+      fi
       SAVE_INTERVAL=${UNLEARN_SAVE_INTERVAL}
       for UNLEARN_METHOD in "${UNLEARN_CLS[@]}"; do
         echo "------- UNLEARN_METHOD=${UNLEARN_METHOD} -------"
@@ -347,7 +364,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
             trainer.method_args.forget_round_count="${FORGET_ROUNDS}" \
             trainer.method_args.recovery_round_start="${RECOVERY_START}" \
             trainer.method_args.filter_alpha="${FILTER_ALPHA}" \
-            trainer.method_args.save_client_splits_for_eval=true \
+            trainer.method_args.save_client_splits_for_eval=false \
             +trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}" \
             +trainer.method_args.forget_indices_path="${FORGET_IDX_FILE}" \
             trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \

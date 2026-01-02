@@ -5,6 +5,7 @@ MUSE_forget_verbmem:
       path: "muse-bench/MUSE-News"
       name: "verbmem"
       split: "forget"
+    indices_path: ${eval.muse.forget_indices_path}
     prefix_key: "prompt"
     text_key: "gt"
     max_length: 2048

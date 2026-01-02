@@ -703,21 +703,17 @@ class FederatedPermTrainer(FinetuneTrainer):
         # 首选显式提供的 filter 基线（full 阶段最后一轮 server pre）；否则退化为当前全局模型
         base_state = None
         if self.filter_base_model_path:
-            try:
-                if self.is_peft:
-                    adapter_path = os.path.join(self.filter_base_model_path, "adapter_model.bin")
-                    if os.path.isfile(adapter_path):
-                        base_state = torch.load(adapter_path, map_location="cpu")
-                    else:
-                        logger.warning(f"adapter_model.bin not found at filter_base_model_path={self.filter_base_model_path}")
-                else:
-                    weight_path = os.path.join(self.filter_base_model_path, "pytorch_model.bin")
-                    if os.path.isfile(weight_path):
-                        base_state = torch.load(weight_path, map_location="cpu")
-                    else:
-                        logger.warning(f"pytorch_model.bin not found at filter_base_model_path={self.filter_base_model_path}")
-            except Exception as exc:
-                logger.warning(f"Failed to load filter base model from {self.filter_base_model_path}: {exc}")
+            if not os.path.isdir(self.filter_base_model_path):
+                raise FileNotFoundError(f"filter_base_model_path does not exist: {self.filter_base_model_path}")
+            if self.is_peft:
+                base_state = self._load_peft_state(self.filter_base_model_path, "filter base model")
+            else:
+                weight_path = os.path.join(self.filter_base_model_path, "pytorch_model.bin")
+                if not os.path.isfile(weight_path):
+                    raise FileNotFoundError(
+                        f"pytorch_model.bin not found at filter_base_model_path={self.filter_base_model_path}"
+                    )
+                base_state = torch.load(weight_path, map_location="cpu")
 
         if base_state is None:
             if self.is_peft:
@@ -796,12 +792,10 @@ class FederatedPermTrainer(FinetuneTrainer):
     ):
         """Train client model locally"""
         # Move client model到目标设备
-        target_device = None
-        # if device is not None:
-        #     target_device = device if isinstance(device, torch.device) else torch.device(device)
-        # el
-        if torch.cuda.is_available():
-            target_device = torch.device("cuda")
+        if device is not None:
+            target_device = device if isinstance(device, torch.device) else torch.device(device)
+        else:
+            target_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         if target_device is not None and target_device.type == "cuda":
             torch.cuda.set_device(target_device)
             client_model = client_model.to(target_device)
@@ -974,30 +968,52 @@ class FederatedPermTrainer(FinetuneTrainer):
     def _load_prev_target_model(self, model_path: str):
         """Load target client's previous post model for prev-CE warm start."""
         if not os.path.isdir(model_path):
-            logger.warning(f"prev_target_model_path does not exist: {model_path}")
-            return None
+            raise FileNotFoundError(f"prev_target_model_path does not exist: {model_path}")
         teacher = deepcopy(self.model).cpu()
-        try:
-            if self.is_peft:
-                adapter_path = os.path.join(model_path, "adapter_model.bin")
-                if not os.path.isfile(adapter_path):
-                    logger.warning(f"adapter_model.bin not found in {model_path}")
-                    return None
-                state_dict = torch.load(adapter_path, map_location="cpu")
-                set_peft_model_state_dict(teacher, state_dict)
-            else:
-                weight_path = os.path.join(model_path, "pytorch_model.bin")
-                if not os.path.isfile(weight_path):
-                    logger.warning(f"pytorch_model.bin not found in {model_path}")
-                    return None
-                state_dict = torch.load(weight_path, map_location="cpu")
-                teacher.load_state_dict(state_dict)
-            teacher.eval()
-            logger.info(f"Loaded prev target model from {model_path}")
-            return teacher
-        except Exception as exc:
-            logger.warning(f"Failed to load prev target model from {model_path}: {exc}")
-            return None
+        if self.is_peft:
+            state_dict = self._load_peft_state(model_path, "prev target model")
+            set_peft_model_state_dict(teacher, state_dict)
+        else:
+            weight_path = os.path.join(model_path, "pytorch_model.bin")
+            if not os.path.isfile(weight_path):
+                raise FileNotFoundError(f"pytorch_model.bin not found in {model_path}")
+            state_dict = torch.load(weight_path, map_location="cpu")
+            teacher.load_state_dict(state_dict)
+        teacher.eval()
+        logger.info(f"Loaded prev target model from {model_path}")
+        return teacher
+
+    def _load_peft_state(self, base_path: str, context: str):
+        """
+        Load a PEFT adapter state; prefer adapter_model.safetensors, fallback to adapter_model.bin.
+        Missing files or load failures raise to surface issues early.
+        """
+        if not os.path.isdir(base_path):
+            raise FileNotFoundError(f"{context} path not found: {base_path}")
+
+        bin_path = os.path.join(base_path, "adapter_model.bin")
+        safetensors_path = os.path.join(base_path, "adapter_model.safetensors")
+
+        # Prefer safetensors if present
+        if os.path.isfile(safetensors_path):
+            try:
+                from safetensors.torch import load_file
+            except Exception as exc:
+                raise ImportError(f"Failed to import safetensors for {context}: {exc}") from exc
+            try:
+                return load_file(safetensors_path, device="cpu")
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load adapter_model.safetensors for {context}: {exc}") from exc
+
+        if os.path.isfile(bin_path):
+            try:
+                return torch.load(bin_path, map_location="cpu")
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load adapter_model.bin for {context}: {exc}") from exc
+
+        raise FileNotFoundError(
+            f"adapter_model.[safetensors|bin] not found in {base_path} for {context}"
+        )
 
 
     def _aggregate_with_alignment(self, round_idx: int, initial_states: List, updated_states: List, global_state: Dict):

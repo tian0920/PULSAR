@@ -241,6 +241,8 @@ def get_federated_full_retain_forget(
         raise ValueError("Must provide retain/forget splits or explicit indices; fallback by retain_ratio is disabled.")
 
     client_datasets = {}
+    retain_all_for_global = []
+    forget_all_for_global = []
     start_idx = 0
     for client_idx in range(num_clients):
         if use_saved_splits:
@@ -345,10 +347,23 @@ def get_federated_full_retain_forget(
             ) as f:
                 json.dump(payload["retain_indices"], f)
 
+        # Collect for global indices (for eval)
+        retain_all_for_global.extend(retain_indices_local)
+        forget_all_for_global.extend(forget_indices_local)
+
         print(
             f"[FedPerm split] client {client_idx}: full={len(full_subset)}, "
             f"retain={len(retain_subset)}, forget={len(forget_subset)}"
         )
+
+    if split_save_dir is not None:
+        os.makedirs(split_save_dir, exist_ok=True)
+        retain_all_for_global = sorted(set(retain_all_for_global))
+        forget_all_for_global = sorted(set(forget_all_for_global))
+        with open(os.path.join(split_save_dir, "global_retain_indices.json"), "w") as f:
+            json.dump(retain_all_for_global, f)
+        with open(os.path.join(split_save_dir, "global_forget_indices.json"), "w") as f:
+            json.dump(forget_all_for_global, f)
 
     return client_datasets
 

@@ -135,7 +135,11 @@ sync_client_splits_full() {
   fi
   if [ -z "$(ls -A "${COMMON_SPLIT_DIR}")" ]; then
     echo "初始化公共 client_splits 到 ${COMMON_SPLIT_DIR}"
-    cp -r "${src_dir}/." "${COMMON_SPLIT_DIR}/"
+    if [ "${src_dir}" != "${COMMON_SPLIT_DIR}" ]; then
+      cp -r "${src_dir}/." "${COMMON_SPLIT_DIR}/"
+    else
+      echo "源目录与目标目录相同且当前为空，请确认上游步骤已生成划分"
+    fi
   fi
   python - "$COMMON_SPLIT_DIR" "$src_dir" <<'PY'
 import json, os, sys, shutil

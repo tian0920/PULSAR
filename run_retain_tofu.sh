@@ -108,12 +108,17 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       HOLDOUT_SPLIT="${HOLDOUT_SPLITS[$idx]}"
       RETAIN_SPLIT="${RETAIN_SPLITS[$idx]}"
 
-      # 共享的客户端划分目录，确保 retain/full/unlearn 一致
-      COMMON_SPLIT_DIR="saves/TOFU/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
+      # 唯一的客户端划分目录，按 ASSIGN_FORGET_TO_REVOKER_ONLY 区分：fedperm / fedperm_only
+      COMMON_SPLIT_DIR="${OUT_ROOT}/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
       mkdir -p "${COMMON_SPLIT_DIR}"
       export FEDPERM_SPLIT_DIR="${COMMON_SPLIT_DIR}"
       RETAIN_IDX_FILE="${COMMON_SPLIT_DIR}/global_retain_indices.json"
       FORGET_IDX_FILE="${COMMON_SPLIT_DIR}/global_forget_indices.json"
+      SPLITS_READY=false
+     if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
+       SPLITS_READY=true
+       echo "Found existing global indices, reuse: ${COMMON_SPLIT_DIR}"
+     fi
 
       echo ">>> SPLITS retain=${RETAIN_SPLIT} forget=${FORGET_SPLIT} holdout=${HOLDOUT_SPLIT}"
 
@@ -122,7 +127,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       ############################
       RETAIN_TASK="retain_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}"
       RETAIN_DIR="${OUT_ROOT}/${RETAIN_TASK}"
-      CLIENT_SPLIT_DIR="${RETAIN_DIR}/client_splits"
+      CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
       FORGET_IDX_PATH="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
       mkdir -p "${RETAIN_DIR}"
 
@@ -130,6 +135,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         echo "Skip retain-only training, final round exists: ${RETAIN_DIR}/round_${GLOBAL_ROUNDS}"
       else
         EXTRA_EVAL_ARGS=()
+        SAVE_SPLITS_FOR_EVAL=true
         if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
           EXTRA_EVAL_ARGS+=(
             eval.tofu.forget_indices_path="${FORGET_IDX_PATH}"
@@ -137,7 +143,8 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           )
         fi
         # 若公共划分已存在，直接复用，不再生成新划分
-        if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
+        if [ "${SPLITS_READY}" = true ]; then
+          SAVE_SPLITS_FOR_EVAL=false
           EXTRA_EVAL_ARGS+=(
             +trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}"
             +trainer.method_args.forget_indices_path="${FORGET_IDX_FILE}"
@@ -161,7 +168,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \
           trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
           trainer.method_args.global_rounds="${GLOBAL_ROUNDS}" \
-          trainer.method_args.save_client_splits_for_eval=true \
+          trainer.method_args.save_client_splits_for_eval="${SAVE_SPLITS_FOR_EVAL}" \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
           trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
           trainer.args.output_dir="${RETAIN_DIR}" \
@@ -170,10 +177,15 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.args.seed="${SEED}" \
           "${EXTRA_EVAL_ARGS[@]}" \
           2>&1 | tee "${LOG_ROOT}/${RETAIN_TASK}.txt"
+        if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
+          SPLITS_READY=true
+        fi
       fi
 
-      # 对齐公共划分
-      sync_client_splits "${COMMON_SPLIT_DIR}"
+      if [ "${SPLITS_READY}" != true ]; then
+        echo "缺少公共划分文件：${COMMON_SPLIT_DIR}，请确保已生成全局索引后再继续。" >&2
+        exit 1
+      fi
 
       # 根据保存频次裁剪 checkpoint
       prune_rounds "${RETAIN_DIR}" "${GLOBAL_ROUNDS}" "${SAVE_INTERVAL}"

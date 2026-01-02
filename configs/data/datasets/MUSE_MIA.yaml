@@ -17,6 +17,7 @@ MUSE_MIA_forget:
       path: "muse-bench/MUSE-News"
       name: "privleak"
       split: "forget"
+    indices_path: ${eval.muse.forget_indices_path}
     prefix_key: "prompt" # doesn't exist in dataset
     text_key: "text"
     max_length: 2048

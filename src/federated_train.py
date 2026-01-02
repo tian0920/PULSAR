@@ -84,11 +84,11 @@ def main(cfg: DictConfig):
         global_forget_indices = cfg.trainer.method_args.get("global_forget_indices", None)
         retain_split_name = cfg.trainer.method_args.get("retain_split_name", None)
         forget_split_name = cfg.trainer.method_args.get("forget_split_name", None)
-        split_save_dir = (
-            os.path.join(cfg.trainer.args.output_dir, "client_splits")
-            if save_client_splits
-            else None
-        )
+        split_save_dir = None
+        if save_client_splits:
+            split_save_dir = os.environ.get("FEDPERM_SPLIT_DIR", None)
+            if not split_save_dir:
+                split_save_dir = os.path.join(cfg.trainer.args.output_dir, "client_splits")
         if split_save_dir:
             os.makedirs(split_save_dir, exist_ok=True)
 
