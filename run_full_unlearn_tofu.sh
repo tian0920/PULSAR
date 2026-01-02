@@ -279,7 +279,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
 
       # 预留 full 阶段最后一轮的 server pre（用于遗忘阶段 filter 基线），避免后续裁剪被删除
       FILTER_BASE_DIR=""
-      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS - 1))
+      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS))
       if [ ${PRE_BASE_ROUND} -ge 1 ]; then
         PRE_BASE_SRC="${FULL_DIR}/round_${PRE_BASE_ROUND}"
         FILTER_BASE_DIR="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_server_pre_base"
