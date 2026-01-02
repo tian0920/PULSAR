@@ -459,27 +459,36 @@ class FederatedPermTrainer(FinetuneTrainer):
                 cidx = int(m.group(1))
                 retain_idx_path = os.path.join(split_dir, f"client{cidx}_retain_indices.json")
 
-            if hasattr(self.evaluator, "eval_cfg") and hasattr(
-                self.evaluator.eval_cfg, "tofu"
-            ):
-                eval_to_fu = self.evaluator.eval_cfg.tofu
-                # 忠实使用指定索引，缺失则跳过评测以避免退化到全量
-                if not os.path.exists(forget_idx_path):
-                    logger.error(
-                        f"Forget indices missing for stage {stage}: {forget_idx_path}. "
-                        "Abort eval to avoid falling back to full dataset."
-                    )
-                    return
-                eval_to_fu.forget_indices_path = forget_idx_path
-
-                if retain_idx_path:
-                    if not os.path.exists(retain_idx_path):
+            if hasattr(self.evaluator, "eval_cfg"):
+                if hasattr(self.evaluator.eval_cfg, "tofu"):
+                    eval_to_fu = self.evaluator.eval_cfg.tofu
+                    # 忠实使用指定索引，缺失则跳过评测以避免退化到全量
+                    if not os.path.exists(forget_idx_path):
                         logger.error(
-                            f"Retain indices missing for stage {stage}: {retain_idx_path}. "
+                            f"Forget indices missing for stage {stage}: {forget_idx_path}. "
                             "Abort eval to avoid falling back to full dataset."
                         )
                         return
-                    eval_to_fu.retain_indices_path = retain_idx_path
+                    eval_to_fu.forget_indices_path = forget_idx_path
+
+                    if retain_idx_path:
+                        if not os.path.exists(retain_idx_path):
+                            logger.error(
+                                f"Retain indices missing for stage {stage}: {retain_idx_path}. "
+                                "Abort eval to avoid falling back to full dataset."
+                            )
+                            return
+                        eval_to_fu.retain_indices_path = retain_idx_path
+
+                if hasattr(self.evaluator.eval_cfg, "muse"):
+                    eval_muse = self.evaluator.eval_cfg.muse
+                    if not os.path.exists(forget_idx_path):
+                        logger.error(
+                            f"MUSE forget indices missing for stage {stage}: {forget_idx_path}. "
+                            "Abort eval to avoid falling back to full dataset."
+                        )
+                        return
+                    eval_muse.forget_indices_path = forget_idx_path
 
                 # 清理已缓存的数据集，确保索引变更生效
                 if hasattr(self.evaluator, "metrics"):
@@ -788,9 +797,10 @@ class FederatedPermTrainer(FinetuneTrainer):
         """Train client model locally"""
         # Move client model到目标设备
         target_device = None
-        if device is not None:
-            target_device = device if isinstance(device, torch.device) else torch.device(device)
-        elif torch.cuda.is_available():
+        # if device is not None:
+        #     target_device = device if isinstance(device, torch.device) else torch.device(device)
+        # el
+        if torch.cuda.is_available():
             target_device = torch.device("cuda")
         if target_device is not None and target_device.type == "cuda":
             torch.cuda.set_device(target_device)

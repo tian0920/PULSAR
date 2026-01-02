@@ -10,6 +10,14 @@ source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 FL_METHOD="${FL_METHOD:-FedAvg}"
 DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff" "NPO" "SimNPO")
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
+GPU_COUNT="${GPU_COUNT:-1}"
+if [ "${GPU_COUNT}" -gt 1 ]; then
+  LAUNCHER=(torchrun --standalone --nproc_per_node="${GPU_COUNT}")
+  echo "Using multi-GPU launcher: ${LAUNCHER[*]}"
+else
+  LAUNCHER=(python)
+  echo "Using single-GPU launcher: ${LAUNCHER[*]}"
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -212,7 +220,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       echo ">>> SPLITS retain=${RETAIN_SPLIT} forget=${FORGET_SPLIT} holdout=${HOLDOUT_SPLIT}"
 
       # 共享的客户端划分目录，确保 retain/full/unlearn 三阶段一致
-      COMMON_SPLIT_DIR="saves/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
+      COMMON_SPLIT_DIR="saves/TOFU/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
       mkdir -p "${COMMON_SPLIT_DIR}"
       export FEDPERM_SPLIT_DIR="${COMMON_SPLIT_DIR}"
       RETAIN_IDX_FILE="${COMMON_SPLIT_DIR}/global_retain_indices.json"
@@ -249,7 +257,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         SKIP_ROUNDS=$(compute_skip_rounds "${FULL_GLOBAL_ROUNDS}" "${FULL_SAVE_INTERVAL}")
         FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
         FEDPERM_SKIP_SAVE_ROUNDS="${SKIP_ROUNDS}" \
-        python src/federated_train.py \
+        "${LAUNCHER[@]}" src/federated_train.py \
           --config-name="${CONFIG_TRAIN}" \
           experiment=finetune/tofu/default \
           model="${MODEL_CFG}" \
@@ -279,7 +287,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
 
       # 预留 full 阶段最后一轮的 server pre（用于遗忘阶段 filter 基线），避免后续裁剪被删除
       FILTER_BASE_DIR=""
-      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS - 1))
+      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS))
       if [ ${PRE_BASE_ROUND} -ge 1 ]; then
         PRE_BASE_SRC="${FULL_DIR}/round_${PRE_BASE_ROUND}"
         FILTER_BASE_DIR="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_server_pre_base"
@@ -322,7 +330,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           SKIP_ROUNDS=$(compute_skip_rounds "${UNLEARN_GLOBAL_ROUNDS}" "${UNLEARN_SAVE_INTERVAL}")
           FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
           FEDPERM_SKIP_SAVE_ROUNDS="${SKIP_ROUNDS}" \
-          python src/federated_train.py \
+          "${LAUNCHER[@]}" src/federated_train.py \
             --config-name="${CONFIG_TRAIN}" \
             experiment=finetune/tofu/default \
             model="${MODEL_CFG}" \

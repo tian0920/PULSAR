@@ -5,6 +5,7 @@ MUSE_forget_knowmem:
       path: "muse-bench/MUSE-News"
       name: "knowmem"
       split: "forget_qa"
+    indices_path: ${eval.muse.forget_indices_path}
     few_shot_dataset_hf_args:
       path: "muse-bench/MUSE-News"
       name: "knowmem"

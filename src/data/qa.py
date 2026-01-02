@@ -34,7 +34,17 @@ class QADataset(Dataset):
                     indices = indices_obj
         if indices is not None:
             # HuggingFace Dataset supports select with a list of indices
-            self.data = self.data.select(indices)
+            max_idx = len(self.data)
+            valid = [i for i in indices if 0 <= int(i) < max_idx]
+            if len(valid) < len(indices):
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Filtered %d invalid indices (>= %d) for QA dataset",
+                    len(indices) - len(valid),
+                    max_idx,
+                )
+            self.data = self.data.select(valid)
         self.data = add_dataset_index(self.data)
         self.fs_data = None
         if few_shot_dataset_hf_args is not None:

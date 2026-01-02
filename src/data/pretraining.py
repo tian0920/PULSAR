@@ -1,5 +1,6 @@
 # import torch
 from torch.utils.data import Dataset
+import json
 from data.utils import (
     load_hf_dataset,
     add_dataset_index,
@@ -18,12 +19,21 @@ class CompletionDataset(Dataset):
         max_length=2048,
         predict_with_generate=False,
         insert_space=False,
+        indices_path=None,
+        indices=None,
     ):
         super(CompletionDataset, self).__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
+        if indices is None and indices_path is not None:
+            with open(indices_path, "r") as f:
+                indices = json.load(f)
         self.data = load_hf_dataset(**hf_args)
         self.data = add_dataset_index(self.data)
+        if indices is not None:
+            max_idx = len(self.data)
+            indices = [i for i in indices if 0 <= int(i) < max_idx]
+            self.data = self.data.select(indices)
         # if either key does not exist in dataset, it is taken as ""
         self.prefix_key = prefix_key
         self.text_key = text_key
@@ -61,12 +71,27 @@ class CompletionDataset(Dataset):
 
 class PretrainingDataset(Dataset):
     def __init__(
-        self, hf_args, template_args, tokenizer, text_key="text", max_length=2048
+        self,
+        hf_args,
+        template_args,
+        tokenizer,
+        text_key="text",
+        max_length=2048,
+        indices_path=None,
+        indices=None,
     ):
         super(PretrainingDataset, self).__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.chunks = self._chunk_raw_text(load_hf_dataset(**hf_args)[text_key])
+        if indices is None and indices_path is not None:
+            with open(indices_path, "r") as f:
+                indices = json.load(f)
+        hf_dataset = load_hf_dataset(**hf_args)
+        if indices is not None:
+            max_idx = len(hf_dataset)
+            indices = [i for i in indices if 0 <= int(i) < max_idx]
+            hf_dataset = hf_dataset.select(indices)
+        self.chunks = self._chunk_raw_text(hf_dataset[text_key])
 
     def _chunk_raw_text(self, raw_text):
         raw_text = "\n\n".join(raw_text)
