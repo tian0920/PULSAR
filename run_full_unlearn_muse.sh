@@ -17,6 +17,14 @@ source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 FL_METHOD="${FL_METHOD:-FedAvg}"
 DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff" "NPO" "SimNPO")
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
+GPU_COUNT="${GPU_COUNT:-1}"
+if [ "${GPU_COUNT}" -gt 1 ]; then
+  LAUNCHER=(torchrun --standalone --nproc_per_node="${GPU_COUNT}")
+  echo "Using multi-GPU launcher: ${LAUNCHER[*]}"
+else
+  LAUNCHER=(python)
+  echo "Using single-GPU launcher: ${LAUNCHER[*]}"
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,18 +52,24 @@ IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 # 配置
 ########################################
 MODEL_CFG="Llama-3.2-1B-Instruct-lora"
-RETAIN_SPLITS=("retain01")
-FORGET_SPLITS=("forget01")
-HOLDOUT_SPLITS=("holdout01")
+RETAIN_SPLITS=("retain1")
+FORGET_SPLITS=("forget")
 DATASET_HANDLER="pretrain"
 DATASET_PATH="muse-bench/MUSE-News"
 DATASET_NAME="train"
 TEXT_KEY="text"
 
 USE_CLIENT_FORGET_EVAL=true
-ASSIGN_FORGET_TO_REVOKER_ONLY=false    # 数据集划分方式
-LOG_ROOT="logs/MUSE/fedperm"
-OUT_ROOT="saves/MUSE/fedperm"
+
+ASSIGN_FORGET_TO_REVOKER_ONLY=false   # 数据集划分方式
+if [ "${ASSIGN_FORGET_TO_REVOKER_ONLY}" = "true" ]; then
+  LOG_ROOT="logs/MUSE/fedperm_only"
+  OUT_ROOT="saves/MUSE/fedperm_only"
+else
+  LOG_ROOT="logs/MUSE/fedperm"
+  OUT_ROOT="saves/MUSE/fedperm"
+fi
+
 # 强制评测使用 muse 组，避免 eval=tofu 时注入失败
 EVAL_GROUP="muse"
 
@@ -102,9 +116,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
   for idx in "${!RETAIN_SPLITS[@]}"; do
     RETAIN_SPLIT="${RETAIN_SPLITS[$idx]}"
     FORGET_SPLIT="${FORGET_SPLITS[$idx]}"
-    HOLDOUT_SPLIT="${HOLDOUT_SPLITS[$idx]}"
-
-    echo ">>> SPLITS retain=${RETAIN_SPLIT} forget=${FORGET_SPLIT} holdout=${HOLDOUT_SPLIT}"
+    echo ">>> SPLITS retain=${RETAIN_SPLIT} forget=${FORGET_SPLIT}"
 
     # 每组 split 各自维护 client_splits，避免相互污染
     COMMON_SPLIT_DIR="saves/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
@@ -141,9 +153,10 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       SKIP_ROUNDS=$(compute_skip_rounds "${FULL_GLOBAL_ROUNDS}" "${FULL_SAVE_INTERVAL}")
       FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
       FEDPERM_SKIP_SAVE_ROUNDS="${SKIP_ROUNDS}" \
-      python src/federated_train.py \
+      "${LAUNCHER[@]}" src/federated_train.py \
         --config-name="${CONFIG_TRAIN}" \
         experiment=finetune/tofu/default \
+        eval=muse \
         model="${MODEL_CFG}" \
         task_name="${FULL_TASK}" \
         trainer=FederatedPermTrainer \
@@ -157,16 +170,16 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
         trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
         trainer.method_args.eval_client_c_idx="${CLIENT_C_IDX}" \
-        trainer.method_args.retain_dataset_handler="${DATASET_HANDLER}" \
-        trainer.method_args.retain_dataset_hf_args.path="${DATASET_PATH}" \
-        trainer.method_args.retain_dataset_hf_args.name="${DATASET_NAME}" \
-        trainer.method_args.retain_dataset_hf_args.split="${RETAIN_SPLIT}" \
-        trainer.method_args.retain_text_key="${TEXT_KEY}" \
-        trainer.method_args.forget_dataset_handler="${DATASET_HANDLER}" \
-        trainer.method_args.forget_dataset_hf_args.path="${DATASET_PATH}" \
-        trainer.method_args.forget_dataset_hf_args.name="${DATASET_NAME}" \
-        trainer.method_args.forget_dataset_hf_args.split="${FORGET_SPLIT}" \
-        trainer.method_args.forget_text_key="${TEXT_KEY}" \
+        +trainer.method_args.retain_dataset_handler="${DATASET_HANDLER}" \
+        +trainer.method_args.retain_dataset_hf_args.path="${DATASET_PATH}" \
+        +trainer.method_args.retain_dataset_hf_args.name="${DATASET_NAME}" \
+        +trainer.method_args.retain_dataset_hf_args.split="${RETAIN_SPLIT}" \
+        +trainer.method_args.retain_text_key="${TEXT_KEY}" \
+        +trainer.method_args.forget_dataset_handler="${DATASET_HANDLER}" \
+        +trainer.method_args.forget_dataset_hf_args.path="${DATASET_PATH}" \
+        +trainer.method_args.forget_dataset_hf_args.name="${DATASET_NAME}" \
+        +trainer.method_args.forget_dataset_hf_args.split="${FORGET_SPLIT}" \
+        +trainer.method_args.forget_text_key="${TEXT_KEY}" \
         data/datasets@data.train=MUSE_retain \
         data.train.MUSE_retain.args.hf_args.name="${DATASET_NAME}" \
         data.train.MUSE_retain.args.hf_args.split="${RETAIN_SPLIT}" \
@@ -217,9 +230,10 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         SKIP_ROUNDS=$(compute_skip_rounds "${UNLEARN_GLOBAL_ROUNDS}" "${UNLEARN_SAVE_INTERVAL}")
         FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
         FEDPERM_SKIP_SAVE_ROUNDS="${SKIP_ROUNDS}" \
-        python src/federated_train.py \
-          --config-name="${CONFIG_TRAIN}" \
-          experiment=finetune/tofu/default \
+      "${LAUNCHER[@]}" src/federated_train.py \
+        --config-name="${CONFIG_TRAIN}" \
+        experiment=finetune/tofu/default \
+        eval=muse \
           model="${MODEL_CFG}" \
           task_name="${FEDPERM_TASK}" \
           trainer=FederatedPermTrainer \
@@ -245,16 +259,16 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           +trainer.method_args.filter_base_model_path="${FILTER_BASE_DIR}" \
           trainer.method_args.prev_target_model_path="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_target_client_${TARGET_CLIENT_IDX}" \
           +trainer.method_args.enable_permutation="${ENABLE_PERMUTATION}" \
-          trainer.method_args.retain_dataset_handler="${DATASET_HANDLER}" \
-          trainer.method_args.retain_dataset_hf_args.path="${DATASET_PATH}" \
-          trainer.method_args.retain_dataset_hf_args.name="${DATASET_NAME}" \
-          trainer.method_args.retain_dataset_hf_args.split="${RETAIN_SPLIT}" \
-          trainer.method_args.retain_text_key="${TEXT_KEY}" \
-          trainer.method_args.forget_dataset_handler="${DATASET_HANDLER}" \
-          trainer.method_args.forget_dataset_hf_args.path="${DATASET_PATH}" \
-          trainer.method_args.forget_dataset_hf_args.name="${DATASET_NAME}" \
-          trainer.method_args.forget_dataset_hf_args.split="${FORGET_SPLIT}" \
-          trainer.method_args.forget_text_key="${TEXT_KEY}" \
+          +trainer.method_args.retain_dataset_handler="${DATASET_HANDLER}" \
+          +trainer.method_args.retain_dataset_hf_args.path="${DATASET_PATH}" \
+          +trainer.method_args.retain_dataset_hf_args.name="${DATASET_NAME}" \
+          +trainer.method_args.retain_dataset_hf_args.split="${RETAIN_SPLIT}" \
+          +trainer.method_args.retain_text_key="${TEXT_KEY}" \
+          +trainer.method_args.forget_dataset_handler="${DATASET_HANDLER}" \
+          +trainer.method_args.forget_dataset_hf_args.path="${DATASET_PATH}" \
+          +trainer.method_args.forget_dataset_hf_args.name="${DATASET_NAME}" \
+          +trainer.method_args.forget_dataset_hf_args.split="${FORGET_SPLIT}" \
+          +trainer.method_args.forget_text_key="${TEXT_KEY}" \
           data/datasets@data.train=MUSE_retain \
           data.train.MUSE_retain.args.hf_args.name="${DATASET_NAME}" \
           data.train.MUSE_retain.args.hf_args.split="${RETAIN_SPLIT}" \

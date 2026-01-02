@@ -181,9 +181,62 @@ def main(cfg: DictConfig):
 
     evaluator = None
     eval_cfgs = cfg.get("eval", None)
-    if eval_cfgs:
-        assert len(eval_cfgs) <= 1, ValueError("Only one evaluation supported while training")
-        eval_name, eval_cfg = next(iter(eval_cfgs.items()))
+    selected_eval = None
+    if cfg.get("hydra") and cfg.hydra.get("runtime") and cfg.hydra.runtime.get("choices"):
+        selected_eval = cfg.hydra.runtime.choices.get("eval")
+    if selected_eval is None:
+        # Fallback for shell wrappers that pin eval via env (e.g., EVAL_GROUP=muse).
+        selected_eval = os.environ.get("EVAL_GROUP") or os.environ.get("EVAL_NAME")
+
+    # Normalise eval configs to a {name: cfg} mapping; some configs package under eval.<name>,
+    # while others inject directly. We only treat entries with a handler as evaluators.
+    def has_handler(node):
+        try:
+            return node.get("handler", None) is not None
+        except Exception:
+            return False
+
+    eval_candidates = {}
+    if isinstance(eval_cfgs, (dict, DictConfig)):
+        for name, maybe_cfg in eval_cfgs.items():
+            if isinstance(maybe_cfg, (dict, DictConfig)) and has_handler(maybe_cfg):
+                eval_candidates[name] = maybe_cfg
+    if not eval_candidates and isinstance(eval_cfgs, (dict, DictConfig)) and has_handler(eval_cfgs):
+        eval_candidates = {"default": eval_cfgs}
+
+    # Heuristic: align eval choice with dataset family when not explicitly provided.
+    data_train_cfg = {}
+    try:
+        data_train_cfg = cfg.data.get("train", {})
+    except Exception:
+        data_train_cfg = {}
+    train_keys = " ".join(list(getattr(data_train_cfg, "keys", lambda: [])()))
+    train_keys_lower = train_keys.lower()
+
+    if eval_candidates:
+        chosen_eval = None
+        if selected_eval:
+            if selected_eval in eval_candidates:
+                chosen_eval = selected_eval
+            else:
+                raise ValueError(
+                    f"Eval choice '{selected_eval}' not found in available evaluators {list(eval_candidates.keys())}. "
+                    "请通过 eval=<name> 或环境变量 EVAL_GROUP/EVAL_NAME 选择正确的评测配置。"
+                )
+        elif "muse" in eval_candidates and "muse" in train_keys_lower:
+            chosen_eval = "muse"
+        elif "tofu" in eval_candidates and "tofu" in train_keys_lower:
+            chosen_eval = "tofu"
+        elif len(eval_candidates) == 1:
+            chosen_eval = next(iter(eval_candidates))
+
+        if chosen_eval is None:
+            raise ValueError(
+                f"检测到多个评测配置 {list(eval_candidates.keys())}，未能确定应使用哪一个。"
+                " 请显式指定 eval=<name>（Hydra 覆盖）或设置环境变量 EVAL_GROUP/EVAL_NAME。"
+            )
+
+        eval_name, eval_cfg = chosen_eval, eval_candidates[chosen_eval]
         evaluator = get_evaluator(
             eval_name,
             eval_cfg,
