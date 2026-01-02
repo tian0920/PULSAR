@@ -10,15 +10,18 @@ source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 FL_METHOD="${FL_METHOD:-FedAvg}"
 DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff" "NPO" "SimNPO")
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
-# 单进程多 GPU：无需 torchrun，内部线程池按 FEDPERM_CLIENT_DEVICES 分配 GPU
 LAUNCHER=(python)
 CLIENT_DEVICES="${CLIENT_DEVICES:-}"
 if [ -n "${CLIENT_DEVICES}" ]; then
   export FEDPERM_CLIENT_DEVICES="${CLIENT_DEVICES}"
-  echo "Using single-process multi-GPU with devices: ${FEDPERM_CLIENT_DEVICES}"
+  echo "Using per-client subprocesses on devices: ${FEDPERM_CLIENT_DEVICES}"
 else
-  echo "Using single-process launcher (set CLIENT_DEVICES=\"0,1,...\" to pin GPUs)"
+  echo "Using per-client subprocesses; set CLIENT_DEVICES=\"0,1,...\" to choose GPUs"
 fi
+# 禁用 SDPA/flash，避免多卡下的 kernel 问题
+export PYTORCH_SDPA_ENABLE_FLASH=0
+export PYTORCH_SDPA_ENABLE_MEM_EFFICIENT=0
+export PYTORCH_SDPA_ENABLE_HEURISTIC=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -71,14 +74,14 @@ CLIENT_C_IDX=2
 ENABLE_PERMUTATION=false    # 神经元转置
 
 # full 阶段
-FULL_GLOBAL_ROUNDS=3
-FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存，1 表示间隔一轮保存（1,3,5...），以此类推
+FULL_GLOBAL_ROUNDS=2
+FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
 
 # 遗忘+恢复阶段（沿用 run_fedperm_only 的编排）
-UNLEARN_GLOBAL_ROUNDS=4
+UNLEARN_GLOBAL_ROUNDS=2
 NORMAL_BEFORE_FORGET=0
-FORGET_ROUNDS=2
-RECOVERY_START=2
+FORGET_ROUNDS=1
+RECOVERY_START=1
 UNLEARN_SAVE_INTERVAL=0  # unlearn 阶段：同上
 
 UNLEARN_EPOCHS=1   # 过滤器训练轮次
@@ -135,45 +138,12 @@ sync_client_splits() {
   sync_client_splits_full "$@"
 }
 
-eval_final_round() {
-  local base_dir="$1"
-  local prefix="$2"
-  local r="${FULL_GLOBAL_ROUNDS}"
-  LAST_ROUND=${r}
-  local post="${base_dir}/round_${r}"
-  CURRENT_ROUND=${r}
-  if [ -d "${post}" ]; then
-    local post_summary_paths=(
-      "${post}/eval/${prefix}_round${r}_post_agg/TOFU_SUMMARY.json"
-      "${base_dir}/eval_rounds/round_${r}/server_post_agg/TOFU_SUMMARY.json"
-    )
-    maybe_run_eval "${post}" "${prefix}_round${r}_post_agg" \
-      "${LOG_ROOT}/${prefix}_round${r}_post_agg.txt" \
-      "${post_summary_paths[@]}"
-  else
-    echo "⚠️ 缺少聚合后检查点：${post}"
-  fi
-
-  local pre_round=$((r-1))
-  if [ ${pre_round} -ge 1 ]; then
-    local pre="${base_dir}/round_${pre_round}"
-    if [ -d "${pre}" ]; then
-      local pre_summary_paths=(
-        "${pre}/eval/${prefix}_round${r}_pre_agg/TOFU_SUMMARY.json"
-        "${base_dir}/eval_rounds/round_${r}/server_pre_agg/TOFU_SUMMARY.json"
-      )
-      maybe_run_eval "${pre}" "${prefix}_round${r}_pre_agg" \
-        "${LOG_ROOT}/${prefix}_round${r}_pre_agg.txt" \
-        "${pre_summary_paths[@]}"
-    fi
-  fi
-}
-
 eval_rounds() {
   local base_dir="$1"
   local prefix="$2"
-  LAST_ROUND=${UNLEARN_GLOBAL_ROUNDS}
-  for ((r=1; r<=UNLEARN_GLOBAL_ROUNDS; r++)); do
+  local total_rounds="${3:-${UNLEARN_GLOBAL_ROUNDS}}"
+  LAST_ROUND=${total_rounds}
+  for ((r=1; r<=total_rounds; r++)); do
     CURRENT_ROUND=${r}
     local post="${base_dir}/round_${r}"
     if [ -d "${post}" ]; then
@@ -203,6 +173,34 @@ eval_rounds() {
   done
 }
 
+# 确认按 SAVE_INTERVAL 需要保留的 round_* 是否都存在且非空
+check_rounds_exist() {
+  local base_dir="$1"
+  local total_rounds="$2"
+  local interval="$3"
+  local gap=$((interval + 1))
+  local missing=()
+  for ((r=1; r<=total_rounds; r++)); do
+    local should_exist=false
+    if [ "${interval}" -le 0 ]; then
+      should_exist=true
+    elif [ "${r}" -eq "${total_rounds}" ] || [ $(((r - 1) % gap)) -eq 0 ]; then
+      should_exist=true
+    fi
+    if [ "${should_exist}" = true ]; then
+      local dir="${base_dir}/round_${r}"
+      if [ ! -d "${dir}" ] || [ -z "$(ls -A "${dir}")" ]; then
+        missing+=("${dir}")
+      fi
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "❌ 缺少应保留的轮次目录：${missing[*]}"
+    return 1
+  fi
+  return 0
+}
+
 ########################################
 # 主流程
 ########################################
@@ -227,10 +225,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       RETAIN_IDX_FILE="${COMMON_SPLIT_DIR}/global_retain_indices.json"
       FORGET_IDX_FILE="${COMMON_SPLIT_DIR}/global_forget_indices.json"
       SPLITS_READY=false
-      if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
-        SPLITS_READY=true
-        echo "Found existing global indices, reuse: ${COMMON_SPLIT_DIR}"
-      fi
       SPLITS_READY=false
       if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
         SPLITS_READY=true
@@ -238,7 +232,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       fi
 
       ########################################
-      # 阶段 1：full 数据联邦训练（只保留最后一轮评测）
+      # 阶段 1：full 数据联邦训练（默认每轮保存+评测）
       ########################################
       SAVE_INTERVAL=${FULL_SAVE_INTERVAL}
       FULL_TASK="full_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}"
@@ -246,7 +240,18 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
       mkdir -p "${FULL_DIR}"
 
+      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS - 1))
+      PRE_BASE_SRC="${FULL_DIR}/round_${PRE_BASE_ROUND}"
+
       if training_complete "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}"; then
+        if ! check_rounds_exist "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}" "${FULL_SAVE_INTERVAL}"; then
+          echo "❌ full 已完成但缺少按 SAVE_INTERVAL 应该存在的轮次；请删除 ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS} 后重新跑 full 阶段" >&2
+          exit 1
+        fi
+        if [ ! -d "${PRE_BASE_SRC}" ]; then
+          echo "❌ full 已完成但缺少中间轮检查点：${PRE_BASE_SRC}；请删除 ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS} 后重新跑 full 阶段（FULL_SAVE_INTERVAL=0 确保每轮保存）" >&2
+          exit 1
+        fi
         echo "Skip full training, final round exists: ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}"
       else
         EXTRA_EVAL_ARGS=()
@@ -303,27 +308,28 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
 
       # 预留 filter 基线：取“最后一轮开始时”服务器下发的模型 = 上一轮聚合产物
       FILTER_BASE_DIR=""
-      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS - 1))
       if [ ${PRE_BASE_ROUND} -ge 1 ]; then
-        PRE_BASE_SRC="${FULL_DIR}/round_${PRE_BASE_ROUND}"
-        FILTER_BASE_DIR="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_server_pre"
-        if [ -d "${PRE_BASE_SRC}" ]; then
-          if [ ! -d "${FILTER_BASE_DIR}" ] || [ -z "$(ls -A "${FILTER_BASE_DIR}")" ]; then
-            echo "Preserve filter base (start of last round) from ${PRE_BASE_SRC} to ${FILTER_BASE_DIR}"
-            mkdir -p "${FILTER_BASE_DIR}"
-            # 仅拷贝内容，避免产生 round_x 嵌套目录
-            cp -r "${PRE_BASE_SRC}/." "${FILTER_BASE_DIR}/"
-          fi
-        else
-          echo "⚠️ 缺少 filter 基线源目录：${PRE_BASE_SRC}"
+        FILTER_BASE_DIR="${FULL_DIR}/round_${PRE_BASE_ROUND}_server_post"
+        if [ ! -d "${PRE_BASE_SRC}" ]; then
+          echo "❌ 缺少 filter 基线源目录：${PRE_BASE_SRC}；请先重新跑 full 阶段生成该轮检查点" >&2
+          exit 1
+        fi
+        if [ ! -d "${FILTER_BASE_DIR}" ] || [ -z "$(ls -A "${FILTER_BASE_DIR}")" ]; then
+          echo "Preserve filter base (start of last round) from ${PRE_BASE_SRC} to ${FILTER_BASE_DIR}"
+          mkdir -p "${FILTER_BASE_DIR}"
+          cp -r "${PRE_BASE_SRC}/." "${FILTER_BASE_DIR}/"
+        fi
+        if [ -z "$(ls -A "${FILTER_BASE_DIR}")" ]; then
+          echo "❌ filter 基线目录仍为空：${FILTER_BASE_DIR}" >&2
+          exit 1
         fi
       fi
 
-      # 根据保存频次裁剪 checkpoint（保留最后一轮）
+      # 根据保存频次裁剪 checkpoint（仅当 SAVE_INTERVAL>0 时删中间轮）
       prune_rounds "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}" "${FULL_SAVE_INTERVAL}"
       SAVE_INTERVAL=${FULL_SAVE_INTERVAL}
 
-      eval_final_round "${FULL_DIR}" "${FULL_TASK}"
+      eval_rounds "${FULL_DIR}" "${FULL_TASK}" "${FULL_GLOBAL_ROUNDS}"
       ########################################
       # 阶段 2：基于 full 模型的 FedPerm 遗忘 + 恢复（每轮评测）
       ########################################

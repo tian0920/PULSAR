@@ -9,6 +9,7 @@ from data.unlearn import ForgetRetainDataset
 from torch.utils.data import Dataset
 from trainer.federated.federated_utils import *
 from peft import PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
+from transformers.trainer_utils import IntervalStrategy, SaveStrategy
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         
   
         self.is_peft = isinstance(self.model, PeftModel)
+        self.args.save_strategy = self._normalize_save_strategy(getattr(self.args, "save_strategy", None))
 
         self.server_momentum = None  
         self.server_velocity = None  
@@ -201,52 +203,16 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             self.aggregate_models(round_idx)
             logger.info(f"Completed global round {round_idx + 1}/{self.global_rounds}")
             
-            if self.args.save_strategy == "epoch" or (round_idx == self.global_rounds - 1):
+            strategy = self._normalize_save_strategy(getattr(self.args, "save_strategy", None))
+            is_epoch = strategy == SaveStrategy.EPOCH
+            if is_epoch or (round_idx == self.global_rounds - 1):
                 save_path = f"{self.args.output_dir}/round_{round_idx + 1}"
                 self.model = self.model.cpu()
                 self.save_model(save_path)
                 logger.info(f"Model saved at {save_path}")
         
         # 保存最终的全局模型与目标客户端模型，便于后续测评
-        self.save_state()
-        final_global_path = f"{self.args.output_dir}/final_global"
-        self.model = self.model.cpu()
-        self.save_model(final_global_path)
-        logger.info(f"Final global model saved at {final_global_path}")
-
-        target_model = None
-        if (
-            0 <= self.target_client_idx < len(self.client_models)
-            and self.client_models[self.target_client_idx] is not None
-        ):
-            target_model = self.client_models[self.target_client_idx]
-        elif unlearn_trainer is not None and hasattr(unlearn_trainer, "model"):
-            target_model = unlearn_trainer.model
-
-        if target_model is not None:
-            final_target_client_path = f"{self.args.output_dir}/final_target_client_{self.target_client_idx}"
-            os.makedirs(final_target_client_path, exist_ok=True)
-            target_model = target_model.cpu()
-            if self.is_peft:
-                logger.info(
-                    f"Saving final target client {self.target_client_idx} PEFT model to {final_target_client_path}"
-                )
-                target_model.save_pretrained(final_target_client_path, safe_serialization=False)
-                if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(final_target_client_path, safe_serialization=False)
-            else:
-                torch.save(
-                    target_model.state_dict(),
-                    os.path.join(final_target_client_path, "pytorch_model.bin"),
-                )
-                if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(final_target_client_path, safe_serialization=False)
-            logger.info(
-                f"Final target client {self.target_client_idx} model saved at {final_target_client_path}"
-            )
-        else:
-            logger.warning("Target client model not found, skipping target client save")
-
+        # 不再额外生成 final_* 目录，依赖 round_N 检查点
         return None
 
     def unlearn_client_model(self, client_model, client_dataset):

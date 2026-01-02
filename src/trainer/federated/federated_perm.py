@@ -4,7 +4,7 @@ from copy import deepcopy
 from typing import Dict, List, Any, Optional
 import os
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import torch.multiprocessing as mp
 from trainer.base import FinetuneTrainer
 from torch.utils.data import Dataset, DataLoader
 from trainer.federated.federated_utils import (
@@ -14,12 +14,158 @@ from trainer.federated.federated_utils import (
     apply_permutation,
     generate_permutation_key,
 )
+from transformers.trainer_utils import IntervalStrategy, SaveStrategy
 from peft import PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
 from trainer.unlearn.grad_diff import GradDiff
 from transformers import default_data_collator
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+def _client_train_worker(payload):
+    """
+    子进程训练单个客户端，避免线程级 set_device 冲突。
+    payload: (
+        client_idx,
+        client_model,
+        client_dataset,
+        tokenizer,
+        data_collator,
+        train_args,
+        template_args,
+        anchor_state,
+        anchor_lambda,
+        prev_teacher_state,
+        is_peft,
+        device_str,
+    )
+    """
+    (
+        client_idx,
+        client_model,
+        client_dataset,
+        tokenizer,
+        data_collator,
+        train_args,
+        template_args,
+        anchor_state,
+        anchor_lambda,
+        prev_teacher_payload,
+        is_peft,
+        device_str,
+        result_queue,
+    ) = payload
+    device = torch.device(device_str)
+    if device.type == "cuda":
+        # 限定子进程只看单张卡，避免 DataParallel 误用多卡
+        target_idx = device.index if device.index is not None else 0
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(target_idx)
+        local_device = torch.device("cuda:0")
+        torch.cuda.set_device(local_device)
+        client_model = client_model.to(local_device)
+        device = local_device
+
+    prev_teacher = None
+    prev_teacher_weight = None
+    if prev_teacher_payload is not None:
+        prev_teacher_state, prev_teacher_weight = prev_teacher_payload
+        prev_teacher = deepcopy(client_model).cpu()
+        if is_peft:
+            set_peft_model_state_dict(prev_teacher, prev_teacher_state)
+        else:
+            prev_teacher.load_state_dict(prev_teacher_state)
+        prev_teacher = prev_teacher.to(device) if device.type == "cuda" else prev_teacher
+
+    trainer = FinetuneTrainer(
+        model=client_model,
+        train_dataset=client_dataset,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        args=train_args,
+        evaluator=None,
+        template_args=template_args,
+    )
+
+    # 可选：为目标客户端添加锚点/prev teacher 正则
+    if anchor_state is not None and anchor_lambda > 0:
+        base_compute_loss = trainer.compute_loss
+
+        def compute_loss_with_anchor(model, inputs, return_outputs=False, num_items_in_batch=None):
+            result = base_compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+                num_items_in_batch=num_items_in_batch,
+            )
+            if isinstance(result, tuple):
+                base_loss, outputs = result
+            else:
+                base_loss, outputs = result, None
+
+            reg = 0.0
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                anchor = anchor_state.get(name)
+                if anchor is None:
+                    continue
+                reg = reg + torch.sum((param - anchor.to(param.device)) ** 2)
+            loss = base_loss + anchor_lambda * reg
+            return (loss, outputs) if return_outputs else loss
+
+        trainer.compute_loss = compute_loss_with_anchor
+    elif prev_teacher is not None:
+        base_compute_loss = trainer.compute_loss
+
+        def compute_loss_with_prev_teacher(model, inputs, return_outputs=False, num_items_in_batch=None):
+            result = base_compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+                num_items_in_batch=num_items_in_batch,
+            )
+            if isinstance(result, tuple):
+                base_loss, outputs = result
+            else:
+                base_loss, outputs = result, None
+
+            logits_student = outputs.logits if outputs is not None else None
+            if logits_student is None:
+                return (base_loss, outputs) if return_outputs else base_loss
+
+            def _teacher_loss(teacher_model):
+                was_training = teacher_model.training
+                teacher_model.eval()
+                t_device = next(teacher_model.parameters()).device
+                target_device = logits_student.device
+                moved = False
+                if t_device != target_device:
+                    teacher_model = teacher_model.to(target_device)
+                    moved = True
+                with torch.no_grad():
+                    t_inputs = {k: v.to(target_device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+                    t_out = teacher_model(**t_inputs)
+                    loss_t = t_out.loss
+                if moved:
+                    teacher_model = teacher_model.to(t_device)
+                if was_training:
+                    teacher_model.train()
+                return loss_t
+
+            loss_prev = _teacher_loss(prev_teacher)
+            weight = float(prev_teacher_weight) if prev_teacher_weight is not None else 1.0
+            loss = base_loss + weight * loss_prev
+            return (loss, outputs) if return_outputs else loss
+
+        trainer.compute_loss = compute_loss_with_prev_teacher
+
+    try:
+        trainer.train()
+        trained_state = get_peft_model_state_dict(trainer.model.cpu()) if is_peft else trainer.model.cpu().state_dict()
+        result_queue.put(("ok", client_idx, trained_state))
+    except Exception as exc:  # noqa: BLE001
+        result_queue.put(("err", client_idx, str(exc)))
 
 
 class FederatedPermTrainer(FinetuneTrainer):
@@ -113,11 +259,22 @@ class FederatedPermTrainer(FinetuneTrainer):
         self.client_data_sizes = []
 
         self.is_peft = isinstance(self.model, PeftModel)
-        # 并行配置：默认使用可用 GPU 数量，也可通过 method_args.client_parallelism / FEDPERM_CLIENT_DEVICES 控制
-        default_parallelism = torch.cuda.device_count() or 1
-        self.client_parallelism = max(1, int(kwargs.get("client_parallelism", default_parallelism)))
+        # 保存策略归一化：支持枚举直接传入，缺省时默认逐轮保存
+        self.args.save_strategy = self._normalize_save_strategy(getattr(self.args, "save_strategy", None))
+        # 多卡：每客户端一子进程；默认使用所有可用 GPU，可通过 env/client_devices 指定
         device_override = kwargs.get("client_devices", None) or os.environ.get("FEDPERM_CLIENT_DEVICES", None)
         self.client_devices = self._parse_client_devices(device_override)
+        if not self.client_devices:
+            self.client_devices = [torch.device("cpu")]
+        self.client_processes = max(1, int(kwargs.get("client_processes", len(self.client_devices))))
+        self.server_device = self._parse_single_device(
+            kwargs.get("server_device", None),
+            default=self.client_devices[0],
+        )
+        self.filter_device = self._parse_single_device(
+            kwargs.get("filter_device", None),
+            default=self.server_device,
+        )
 
         if not self.federated_dataset:
             logger.warning("No federated dataset provided!")
@@ -297,7 +454,7 @@ class FederatedPermTrainer(FinetuneTrainer):
                 training_tasks.append(
                     (
                         client_idx,
-                        client_model,
+                        deepcopy(client_model).cpu(),
                         client_dataset,
                         anchor_state,
                         anchor_lambda,
@@ -306,34 +463,130 @@ class FederatedPermTrainer(FinetuneTrainer):
                     )
                 )
 
-            max_workers = max(1, min(self.client_parallelism, len(self.client_devices)))
-            logger.info(f"Launching client training with up to {max_workers} workers over devices {self.client_devices}")
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self._train_client_task,
-                        idx,
-                        model,
-                        dataset,
-                        anchor_state,
-                        anchor_lambda,
-                        prev_teacher,
-                        device,
+            # 通过多进程并行各客户端（每卡一进程）；当仅有单卡时改为串行避免 OOM
+            max_workers = max(1, min(self.client_processes, len(self.client_devices)))
+            if max_workers == 1:
+                logger.info("Single device detected; training clients sequentially to avoid OOM")
+                for (
+                    idx,
+                    model,
+                    dataset,
+                    anchor_state,
+                    anchor_lambda,
+                    prev_teacher,
+                    device,
+                ) in training_tasks:
+                    client_idx, trained_model, updated_state = self._train_client_task(
+                        idx, model, dataset, anchor_state, anchor_lambda, prev_teacher, device
                     )
-                    for (
-                        idx,
-                        model,
-                        dataset,
-                        anchor_state,
-                        anchor_lambda,
-                        prev_teacher,
-                        device,
-                    ) in training_tasks
-                ]
-                for future in as_completed(futures):
-                    client_idx, trained_model, updated_state = future.result()
                     client_updated_states[client_idx] = updated_state
                     self.client_models[client_idx] = trained_model
+            else:
+                logger.info(f"Launching client training with {max_workers} processes over devices {self.client_devices}")
+                ctx = mp.get_context("spawn")
+                result_queue = ctx.Queue()
+                processes = []
+
+                def _spawn_task(task):
+                    (
+                        idx,
+                        model,
+                        dataset,
+                        anchor_state,
+                        anchor_lambda,
+                        prev_teacher,
+                        device,
+                    ) = task
+                    prev_teacher_state = None
+                    prev_teacher_weight = None
+                    if prev_teacher is not None:
+                        prev_teacher_weight = float(self.target_prev_ce_weight)
+                        prev_teacher_state = (
+                            get_peft_model_state_dict(prev_teacher)
+                            if self.is_peft
+                            else prev_teacher.state_dict()
+                        )
+                    p = ctx.Process(
+                        target=_client_train_worker,
+                        args=(
+                            (
+                                idx,
+                                model,
+                                dataset,
+                                self.tokenizer,
+                                self.data_collator,
+                                self.args,
+                                self.template_args,
+                                anchor_state,
+                                anchor_lambda,
+                                (prev_teacher_state, prev_teacher_weight) if prev_teacher_state is not None else None,
+                                self.is_peft,
+                                str(device),
+                                result_queue,
+                            ),
+                        ),
+                    )
+                    p.start()
+                    return p
+
+                # 启动不超过 max_workers 的并发进程
+                active = []
+                pending_tasks = list(training_tasks)
+                err_status = None
+                while pending_tasks or active:
+                    while pending_tasks and len(active) < max_workers:
+                        task = pending_tasks.pop(0)
+                        active.append(_spawn_task(task))
+
+                    status, client_idx, payload = result_queue.get()
+                    if status == "err":
+                        err_status = (client_idx, payload)
+                        break
+                    trained_state = payload
+                    if self.is_peft:
+                        set_peft_model_state_dict(self.client_models[client_idx], trained_state)
+                    else:
+                        self.client_models[client_idx].load_state_dict(trained_state)
+                    client_updated_states[client_idx] = trained_state
+
+                    # 回收已结束的进程
+                    still_active = []
+                    for p in active:
+                        if p.is_alive():
+                            still_active.append(p)
+                        else:
+                            p.join()
+                    active = still_active
+
+                # 无论是否出错，都要终止剩余进程
+                for p in active:
+                    p.terminate()
+                    p.join()
+
+                # 如有错误（OOM等），回退到串行执行
+                if err_status is not None:
+                    client_idx, payload = err_status
+                    msg = str(payload).lower()
+                    if "out of memory" in msg or "cuda oom" in msg:
+                        logger.warning(
+                            f"Client {client_idx} training hit OOM; falling back to sequential execution on available devices."
+                        )
+                        for (
+                            idx,
+                            model,
+                            dataset,
+                            anchor_state,
+                            anchor_lambda,
+                            prev_teacher,
+                            device,
+                        ) in training_tasks:
+                            client_idx, trained_model, updated_state = self._train_client_task(
+                                idx, model, dataset, anchor_state, anchor_lambda, prev_teacher, device
+                            )
+                            client_updated_states[client_idx] = updated_state
+                            self.client_models[client_idx] = trained_model
+                    else:
+                        raise RuntimeError(f"Client {client_idx} training failed: {payload}")
 
             # 训练后评测（串行，避免共享 evaluator 的并发问题）
             for client_idx in range(self.num_clients):
@@ -362,65 +615,11 @@ class FederatedPermTrainer(FinetuneTrainer):
                 stage="server_post_agg",
             )
             
-        logger.info(f"Completed global round {round_idx + 1}/{self.global_rounds}")
-            
-        # Save model
-        if self._should_save_round(round_idx):
-            save_path = f"{self.args.output_dir}/round_{round_idx + 1}"
-            self.model = self.model.cpu()
-            self.save_model(save_path)
-            logger.info(f"Model saved at {save_path}")
+            logger.info(f"Completed global round {round_idx + 1}/{self.global_rounds}")
 
-            # Save target client model (for evaluation of targeted unlearning)
-            if 0 <= self.target_client_idx < len(self.client_models) and self.client_models[self.target_client_idx] is not None:
-                target_client_model = self.client_models[self.target_client_idx]
-                # 更新上一轮的 post 模型
-                self.prev_target_model_post = deepcopy(target_client_model).cpu()
-                target_client_save_path = f"{self.args.output_dir}/round_{round_idx + 1}_target_client_{self.target_client_idx}"
-                os.makedirs(target_client_save_path, exist_ok=True)
-                
-                if self.is_peft:
-                    logger.info(f"Saving target client {self.target_client_idx} PEFT model to {target_client_save_path}")
-                    target_client_model = target_client_model.cpu()
-                    target_client_model.save_pretrained(target_client_save_path, safe_serialization=False)
-                    if self.tokenizer is not None:
-                        self.tokenizer.save_pretrained(target_client_save_path, safe_serialization=False)
-                else:
-                    # For non-PEFT models, save using standard method
-                    target_client_model = target_client_model.cpu()
-                    torch.save(target_client_model.state_dict(), os.path.join(target_client_save_path, "pytorch_model.bin"))
-                    if self.tokenizer is not None:
-                        self.tokenizer.save_pretrained(target_client_save_path, safe_serialization=False)
-                
-                logger.info(f"Target client {self.target_client_idx} model saved at {target_client_save_path}")
+            self._save_round_outputs(round_idx)
         
-        # Save final models (global and target client)
-        self.save_state()
-        final_global_path = f"{self.args.output_dir}/final_global"
-        self.model = self.model.cpu()
-        self.save_model(final_global_path)
-        logger.info(f"Final global model saved at {final_global_path}")
-        
-        # Save final target client model
-        if 0 <= self.target_client_idx < len(self.client_models) and self.client_models[self.target_client_idx] is not None:
-            target_client_model = self.client_models[self.target_client_idx]
-            final_target_client_path = f"{self.args.output_dir}/final_target_client_{self.target_client_idx}"
-            os.makedirs(final_target_client_path, exist_ok=True)
-            
-            if self.is_peft:
-                logger.info(f"Saving final target client {self.target_client_idx} PEFT model to {final_target_client_path}")
-                target_client_model = target_client_model.cpu()
-                target_client_model.save_pretrained(final_target_client_path, safe_serialization=False)
-                if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(final_target_client_path, safe_serialization=False)
-            else:
-                target_client_model = target_client_model.cpu()
-                torch.save(target_client_model.state_dict(), os.path.join(final_target_client_path, "pytorch_model.bin"))
-                if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(final_target_client_path, safe_serialization=False)
-            
-            logger.info(f"Final target client {self.target_client_idx} model saved at {final_target_client_path}")
-        
+        # 不再额外生成 final_* 目录，依赖 round_N 检查点
         return None
 
     def _maybe_evaluate_model(self, model, round_idx: int, stage: str):
@@ -679,8 +878,19 @@ class FederatedPermTrainer(FinetuneTrainer):
         else:
             logger.info(f"Using default {unlearn_args.num_train_epochs} epochs for unlearn stage")
 
+        # 遗忘阶段强制单卡运行，避免 DataParallel 在多卡可见时占用额外显存
+        prev_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        if self.filter_device.type == "cuda":
+            target_idx = self.filter_device.index if self.filter_device.index is not None else 0
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(target_idx)
+            # Hint HF Trainer to stay single-GPU
+            object.__setattr__(unlearn_args, "_n_gpu", 1)
+
         # 使用当前全局模型的一个拷贝作为遗忘起点
         unlearn_model = deepcopy(self.model)
+        if self.filter_device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.set_device(self.filter_device)
+            unlearn_model = unlearn_model.to(self.filter_device)
 
         # 只用 forget 数据驱动过滤器：retain_loss 权重设为 0
         unlearn_trainer = GradDiff(
@@ -695,8 +905,16 @@ class FederatedPermTrainer(FinetuneTrainer):
         )
 
         logger.info("Start unlearning training on Client A's data (GradDiff)...")
-        unlearn_trainer.train()
+        try:
+            unlearn_trainer.train()
+        finally:
+            # 恢复 CUDA_VISIBLE_DEVICES
+            if prev_visible is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = prev_visible
+            elif "CUDA_VISIBLE_DEVICES" in os.environ:
+                del os.environ["CUDA_VISIBLE_DEVICES"]
         logger.info("Unlearning training finished.")
+        unlearn_model = unlearn_trainer.model.cpu()
 
         # 3. 计算当前全局参数与遗忘后模型之间的差值 → 过滤器 F_A
         # Extract state dicts (can be done on GPU if models are on GPU)
@@ -888,33 +1106,6 @@ class FederatedPermTrainer(FinetuneTrainer):
             torch.cuda.empty_cache()
         return trained_model
 
-    def _parse_client_devices(self, device_spec: Optional[str]) -> List[torch.device]:
-        """
-        返回可用设备列表；默认使用所有 GPU，若无 GPU 则仅 CPU。
-        device_spec 可为逗号分隔的 GPU 编号（如 "0,1"）。
-        """
-        if not torch.cuda.is_available():
-            return [torch.device("cpu")]
-        if device_spec:
-            devices = []
-            for part in str(device_spec).split(","):
-                part = part.strip()
-                if part == "":
-                    continue
-                try:
-                    idx = int(part)
-                    if idx < torch.cuda.device_count():
-                        devices.append(torch.device(f"cuda:{idx}"))
-                except ValueError:
-                    logger.warning(f"Invalid device id in FEDPERM_CLIENT_DEVICES: {part}")
-            if devices:
-                return devices
-        return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
-
-    def _device_for_client(self, client_idx: int) -> torch.device:
-        pool = self.client_devices or [torch.device("cpu")]
-        return pool[client_idx % len(pool)]
-
     def _train_client_task(
         self,
         client_idx: int,
@@ -948,6 +1139,45 @@ class FederatedPermTrainer(FinetuneTrainer):
         if isinstance(batch, list):
             return [self._move_batch_to_device(v, device) for v in batch]
         return batch
+
+    def _save_round_outputs(self, round_idx: int):
+        """Persist server and target-client checkpoints for a given round."""
+        skip_env = os.environ.get("FEDPERM_SKIP_SAVE_ROUNDS", "")
+        skip_rounds = set()
+        if skip_env:
+            try:
+                skip_rounds = {int(x) for x in skip_env.split(",") if x.strip() != ""}
+            except Exception as exc:
+                logger.warning(f"Failed to parse FEDPERM_SKIP_SAVE_ROUNDS='{skip_env}': {exc}")
+        if round_idx in skip_rounds and round_idx != self.global_rounds - 1:
+            logger.info(f"Skipping save at round {round_idx + 1} due to FEDPERM_SKIP_SAVE_ROUNDS")
+            return
+
+        save_path = f"{self.args.output_dir}/round_{round_idx + 1}"
+        # 仅保存模型权重（PEFT 保存 adapter），不重复写 tokenizer，避免后续误用 round_* 目录作为 tokenizer 路径
+        self.model = self.model.cpu()
+        self._save_model_only(self.model, save_path)
+        logger.info(f"Model saved at {save_path} (model only, tokenizer not duplicated)")
+
+        if 0 <= self.target_client_idx < len(self.client_models) and self.client_models[self.target_client_idx] is not None:
+            target_client_model = self.client_models[self.target_client_idx]
+            self.prev_target_model_post = deepcopy(target_client_model).cpu()
+            target_client_save_path = f"{self.args.output_dir}/round_{round_idx + 1}_target_client_{self.target_client_idx}"
+            os.makedirs(target_client_save_path, exist_ok=True)
+
+            if self.is_peft:
+                logger.info(
+                    f"Saving target client {self.target_client_idx} PEFT model to {target_client_save_path} (model only)"
+                )
+                target_client_model = target_client_model.cpu()
+                target_client_model.save_pretrained(
+                    target_client_save_path, safe_serialization=False
+                )
+            else:
+                target_client_model = target_client_model.cpu()
+                torch.save(target_client_model.state_dict(), os.path.join(target_client_save_path, "pytorch_model.bin"))
+
+            logger.info(f"Target client {self.target_client_idx} model saved at {target_client_save_path}")
 
     def _infer_batch_size(self, batch) -> int:
         """Infer batch size from the first tensor in batch."""
@@ -1015,6 +1245,59 @@ class FederatedPermTrainer(FinetuneTrainer):
             f"adapter_model.[safetensors|bin] not found in {base_path} for {context}"
         )
 
+    def _parse_client_devices(self, device_spec: Optional[str]) -> List[torch.device]:
+        """
+        返回可用设备列表；默认使用所有 GPU，若无 GPU 则仅 CPU。
+        device_spec 可为逗号分隔的 GPU 编号（如 "0,1"）。
+        """
+        if not torch.cuda.is_available():
+            return [torch.device("cpu")]
+        if device_spec:
+            devices = []
+            for part in str(device_spec).split(","):
+                part = part.strip()
+                if part == "":
+                    continue
+                try:
+                    idx = int(part)
+                    if idx < torch.cuda.device_count():
+                        devices.append(torch.device(f"cuda:{idx}"))
+                except ValueError:
+                    logger.warning(f"Invalid device id in FEDPERM_CLIENT_DEVICES: {part}")
+            if devices:
+                return devices
+        return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+
+    def _parse_single_device(self, device_spec: Optional[str], default: torch.device) -> torch.device:
+        if device_spec is None:
+            return default
+        try:
+            if device_spec.startswith("cuda"):
+                return torch.device(device_spec)
+            if device_spec == "cpu":
+                return torch.device("cpu")
+            idx = int(device_spec)
+            if torch.cuda.is_available() and idx < torch.cuda.device_count():
+                return torch.device(f"cuda:{idx}")
+        except Exception:
+            logger.warning(f"Invalid device spec '{device_spec}', fallback to {default}")
+        return default
+
+    def _device_for_client(self, client_idx: int) -> torch.device:
+        pool = self.client_devices or [torch.device("cpu")]
+        return pool[client_idx % len(pool)]
+
+    def _save_model_only(self, model, output_dir: str):
+        """
+        Save only model weights (adapter for PEFT), skipping tokenizer to avoid
+        accidentally reusing round_* dirs as tokenizer path.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        if self.is_peft:
+            model.save_pretrained(output_dir, safe_serialization=False)
+        else:
+            torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+
 
     def _aggregate_with_alignment(self, round_idx: int, initial_states: List, updated_states: List, global_state: Dict):
         """
@@ -1041,8 +1324,8 @@ class FederatedPermTrainer(FinetuneTrainer):
                 client_weights = client_weights[: self.num_clients]
 
         # Determine target device for aggregation (prefer GPU if available)
-        use_gpu_for_agg = torch.cuda.is_available()
-        agg_device = torch.device("cuda") if use_gpu_for_agg else torch.device("cpu")
+        use_gpu_for_agg = self.server_device.type == "cuda" and torch.cuda.is_available()
+        agg_device = self.server_device if use_gpu_for_agg else torch.device("cpu")
         
         # Move global_state to aggregation device if needed
         if use_gpu_for_agg:
@@ -1152,9 +1435,7 @@ class FederatedPermTrainer(FinetuneTrainer):
         logger.info(f"FedPerm state saved to {output_dir}")
 
     def _should_save_round(self, round_idx: int) -> bool:
-        """Respect FEDPERM_SKIP_SAVE_ROUNDS env for per-round checkpoints."""
-        if self.args.save_strategy != "epoch" and round_idx != self.global_rounds - 1:
-            return False
+        """Respect FEDPERM_SKIP_SAVE_ROUNDS env; otherwise默认每轮保存。"""
         skip_env = os.environ.get("FEDPERM_SKIP_SAVE_ROUNDS", "")
         if skip_env:
             try:
@@ -1167,6 +1448,26 @@ class FederatedPermTrainer(FinetuneTrainer):
             except Exception as exc:
                 logger.warning(f"Failed to parse FEDPERM_SKIP_SAVE_ROUNDS='{skip_env}': {exc}")
         return True
+
+    @staticmethod
+    def _normalize_save_strategy(strategy):
+        """Accept SaveStrategy/IntervalStrategy/str; default to EPOCH when None."""
+        if isinstance(strategy, SaveStrategy):
+            return strategy
+        if isinstance(strategy, IntervalStrategy):
+            # IntervalStrategy shares values with SaveStrategy ("no","steps","epoch")
+            try:
+                return SaveStrategy(strategy.value)
+            except Exception:
+                return SaveStrategy.EPOCH
+        if isinstance(strategy, str):
+            try:
+                return SaveStrategy(strategy.lower())
+            except Exception:
+                return SaveStrategy.EPOCH
+        if strategy is None:
+            return SaveStrategy.EPOCH
+        return SaveStrategy.EPOCH
 
     def _is_adapter_parameter(self, name: str, param: torch.Tensor) -> bool:
         """

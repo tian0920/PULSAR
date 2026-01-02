@@ -21,9 +21,9 @@ LAUNCHER=(python)
 CLIENT_DEVICES="${CLIENT_DEVICES:-}"
 if [ -n "${CLIENT_DEVICES}" ]; then
   export FEDPERM_CLIENT_DEVICES="${CLIENT_DEVICES}"
-  echo "Using single-process multi-GPU with devices: ${FEDPERM_CLIENT_DEVICES}"
+  echo "Using per-client subprocesses on devices: ${FEDPERM_CLIENT_DEVICES}"
 else
-  echo "Using single-process launcher (set CLIENT_DEVICES=\"0,1,...\" to pin GPUs)"
+  echo "Using per-client subprocesses; set CLIENT_DEVICES=\"0,1,...\" to choose GPUs"
 fi
 
 while [[ $# -gt 0 ]]; do

@@ -2,14 +2,71 @@ import torch
 import logging
 from copy import deepcopy
 from typing import Dict, List, Any, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import torch.multiprocessing as mp
 
 from trainer.base import FinetuneTrainer
 from torch.utils.data import Dataset
 from trainer.federated.federated_utils import *
 from peft import PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
+from transformers.trainer_utils import IntervalStrategy, SaveStrategy
 import os
 import shutil
+
+
+def _client_finetune_worker(payload):
+    """
+    子进程训练单个客户端，避免线程级 set_device 冲突。
+    payload: (
+        client_idx,
+        client_model,
+        client_dataset,
+        tokenizer,
+        data_collator,
+        train_args,
+        template_args,
+        is_peft,
+        device_str,
+        result_queue,
+    )
+    """
+    (
+        client_idx,
+        client_model,
+        client_dataset,
+        tokenizer,
+        data_collator,
+        train_args,
+        template_args,
+        is_peft,
+        device_str,
+        result_queue,
+    ) = payload
+    device = torch.device(device_str)
+    if device.type == "cuda":
+        # 限定子进程只看单张卡，避免 DataParallel 误用多卡
+        target_idx = device.index if device.index is not None else 0
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(target_idx)
+        local_device = torch.device("cuda:0")
+        torch.cuda.set_device(local_device)
+        client_model = client_model.to(local_device)
+        device = local_device
+
+    trainer = FinetuneTrainer(
+        model=client_model,
+        train_dataset=client_dataset,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        args=train_args,
+        evaluator=None,
+        template_args=template_args,
+    )
+
+    try:
+        trainer.train()
+        trained_state = get_peft_model_state_dict(trainer.model.cpu()) if is_peft else trainer.model.cpu().state_dict()
+        result_queue.put(("ok", client_idx, trained_state))
+    except Exception as exc:  # noqa: BLE001
+        result_queue.put(("err", client_idx, str(exc)))
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +114,20 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         self.client_data_sizes = []  
         self.kwargs = kwargs
 
-        # 并行配置：默认使用可用 GPU 数，可通过 method_args.client_parallelism / FEDPERM_CLIENT_DEVICES 覆盖
-        default_parallelism = torch.cuda.device_count() or 1
-        self.client_parallelism = max(1, int(kwargs.get("client_parallelism", default_parallelism)))
+        # 多卡：每客户端一子进程；默认使用所有可用 GPU，可通过 env/client_devices 指定
         device_override = kwargs.get("client_devices", None) or os.environ.get("FEDPERM_CLIENT_DEVICES", None)
         self.client_devices = self._parse_client_devices(device_override)
+        if not self.client_devices:
+            self.client_devices = [torch.device("cpu")]
+        self.client_processes = max(1, int(kwargs.get("client_processes", len(self.client_devices))))
+        self.server_device = self._parse_single_device(
+            kwargs.get("server_device", None),
+            default=self.client_devices[0],
+        )
         
 
         self.is_peft = isinstance(self.model, PeftModel)
+        self.args.save_strategy = self._normalize_save_strategy(getattr(self.args, "save_strategy", None))
 
 
 
@@ -156,28 +219,55 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 training_tasks.append(
                     (
                         client_idx,
-                        client_model,
+                        deepcopy(client_model).cpu(),
                         client_dataset,
                         self._device_for_client(client_idx),
                     )
                 )
 
-            max_workers = max(1, min(self.client_parallelism, len(self.client_devices)))
-            logger.info(f"Launching client training with up to {max_workers} workers over devices {self.client_devices}")
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self._train_client_task,
-                        idx,
-                        model,
-                        dataset,
-                        device,
-                    )
-                    for (idx, model, dataset, device) in training_tasks
-                ]
-                for future in as_completed(futures):
-                    client_idx, trained_client_model = future.result()
-                    self.client_models[client_idx] = trained_client_model
+            # 多进程并行客户端训练（每卡一进程）
+            max_workers = max(1, min(self.client_processes, len(self.client_devices)))
+            logger.info(f"Launching client training with {max_workers} processes over devices {self.client_devices}")
+            ctx = mp.get_context("spawn")
+            result_queue = ctx.Queue()
+            processes = []
+            for (idx, model, dataset, device) in training_tasks:
+                p = ctx.Process(
+                    target=_client_finetune_worker,
+                    args=(
+                        (
+                            idx,
+                            model,
+                            dataset,
+                            self.tokenizer,
+                            self.data_collator,
+                            self.args,
+                            self.template_args,
+                            self.is_peft,
+                            str(device),
+                            result_queue,
+                        ),
+                    ),
+                )
+                p.start()
+                processes.append(p)
+
+            finished = 0
+            while finished < len(processes):
+                status, client_idx, payload = result_queue.get()
+                if status == "err":
+                    for p in processes:
+                        p.terminate()
+                    raise RuntimeError(f"Client {client_idx} training failed: {payload}")
+                trained_state = payload
+                if self.is_peft:
+                    set_peft_model_state_dict(self.client_models[client_idx], trained_state)
+                else:
+                    self.client_models[client_idx].load_state_dict(trained_state)
+                finished += 1
+
+            for p in processes:
+                p.join()
 
             # Client-side eval after local training（串行以避免 evaluator 并发冲突）
             for client_idx in range(self.num_clients):
@@ -288,33 +378,6 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         if target_device is not None and target_device.type == "cuda":
             torch.cuda.empty_cache()
         return trained_model
-
-    def _parse_client_devices(self, device_spec: Optional[str]) -> List[torch.device]:
-        """
-        返回可用设备列表；默认使用所有 GPU，若无 GPU 则仅 CPU。
-        device_spec 可为逗号分隔的 GPU 编号（如 "0,1"）。
-        """
-        if not torch.cuda.is_available():
-            return [torch.device("cpu")]
-        if device_spec:
-            devices = []
-            for part in str(device_spec).split(","):
-                part = part.strip()
-                if part == "":
-                    continue
-                try:
-                    idx = int(part)
-                    if idx < torch.cuda.device_count():
-                        devices.append(torch.device(f"cuda:{idx}"))
-                except ValueError:
-                    logger.warning(f"Invalid device id in FEDPERM_CLIENT_DEVICES: {part}")
-            if devices:
-                return devices
-        return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
-
-    def _device_for_client(self, client_idx: int) -> torch.device:
-        pool = self.client_devices or [torch.device("cpu")]
-        return pool[client_idx % len(pool)]
 
     def _train_client_task(
         self,
@@ -473,8 +536,8 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         logger.info(f"Client weights: {[f'{w:.4f}' for w in client_weights]}")
         
         # Determine target device for aggregation (prefer GPU if available)
-        use_gpu_for_agg = torch.cuda.is_available()
-        agg_device = torch.device("cuda") if use_gpu_for_agg else torch.device("cpu")
+        use_gpu_for_agg = self.server_device.type == "cuda" and torch.cuda.is_available()
+        agg_device = self.server_device if use_gpu_for_agg else torch.device("cpu")
         
         if self.is_peft:
            
@@ -630,7 +693,9 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
 
     def _should_save_round(self, round_idx: int) -> bool:
         """Respect FEDPERM_SKIP_SAVE_ROUNDS env for per-round checkpoints."""
-        if self.args.save_strategy != "epoch" and round_idx != self.global_rounds - 1:
+        strategy = self._normalize_save_strategy(getattr(self.args, "save_strategy", None))
+        is_epoch = strategy == SaveStrategy.EPOCH
+        if not is_epoch and round_idx != self.global_rounds - 1:
             return False
         skip_env = os.environ.get("FEDPERM_SKIP_SAVE_ROUNDS", "")
         if skip_env:
@@ -644,6 +709,25 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
             except Exception as exc:
                 logger.warning(f"Failed to parse FEDPERM_SKIP_SAVE_ROUNDS='{skip_env}': {exc}")
         return True
+
+    @staticmethod
+    def _normalize_save_strategy(strategy):
+        """Accept SaveStrategy/IntervalStrategy/str; default to EPOCH when None."""
+        if isinstance(strategy, SaveStrategy):
+            return strategy
+        if isinstance(strategy, IntervalStrategy):
+            try:
+                return SaveStrategy(strategy.value)
+            except Exception:
+                return SaveStrategy.EPOCH
+        if isinstance(strategy, str):
+            try:
+                return SaveStrategy(strategy.lower())
+            except Exception:
+                return SaveStrategy.EPOCH
+        if strategy is None:
+            return SaveStrategy.EPOCH
+        return SaveStrategy.EPOCH
 
     def _select_train_dataset(self, client_data):
         """
@@ -659,3 +743,45 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 return client_data.forget
             return getattr(client_data, "full", client_data)
         return client_data
+
+    def _parse_client_devices(self, device_spec: Optional[str]) -> List[torch.device]:
+        """
+        返回可用设备列表；默认使用所有 GPU，若无 GPU 则仅 CPU。
+        device_spec 可为逗号分隔的 GPU 编号（如 "0,1"）。
+        """
+        if not torch.cuda.is_available():
+            return [torch.device("cpu")]
+        if device_spec:
+            devices = []
+            for part in str(device_spec).split(","):
+                part = part.strip()
+                if part == "":
+                    continue
+                try:
+                    idx = int(part)
+                    if idx < torch.cuda.device_count():
+                        devices.append(torch.device(f"cuda:{idx}"))
+                except ValueError:
+                    logger.warning(f"Invalid device id in FEDPERM_CLIENT_DEVICES: {part}")
+            if devices:
+                return devices
+        return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+
+    def _parse_single_device(self, device_spec: Optional[str], default: torch.device) -> torch.device:
+        if device_spec is None:
+            return default
+        try:
+            if device_spec.startswith("cuda"):
+                return torch.device(device_spec)
+            if device_spec == "cpu":
+                return torch.device("cpu")
+            idx = int(device_spec)
+            if torch.cuda.is_available() and idx < torch.cuda.device_count():
+                return torch.device(f"cuda:{idx}")
+        except Exception:
+            logger.warning(f"Invalid device spec '{device_spec}', fallback to {default}")
+        return default
+
+    def _device_for_client(self, client_idx: int) -> torch.device:
+        pool = self.client_devices or [torch.device("cpu")]
+        return pool[client_idx % len(pool)]

@@ -10,14 +10,13 @@ source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 FL_METHOD="${FL_METHOD:-FedAvg}"
 IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
-# 单进程多 GPU：无需 torchrun，内部线程池按 FEDPERM_CLIENT_DEVICES 分配 GPU
 LAUNCHER=(python)
 CLIENT_DEVICES="${CLIENT_DEVICES:-}"
 if [ -n "${CLIENT_DEVICES}" ]; then
   export FEDPERM_CLIENT_DEVICES="${CLIENT_DEVICES}"
-  echo "Using single-process multi-GPU with devices: ${FEDPERM_CLIENT_DEVICES}"
+  echo "Using per-client subprocesses on devices: ${FEDPERM_CLIENT_DEVICES}"
 else
-  echo "Using single-process launcher (set CLIENT_DEVICES=\"0,1,...\" to pin GPUs)"
+  echo "Using per-client subprocesses; set CLIENT_DEVICES=\"0,1,...\" to choose GPUs"
 fi
 
 ########################################
@@ -27,7 +26,7 @@ FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
 RETAIN_SPLITS=("retain90")
 USE_CLIENT_FORGET_EVAL=true  # 是否在 forget_utility 中使用目标客户端的 forget 子集
-ASSIGN_FORGET_TO_REVOKER_ONLY=false   # 数据集划分方式
+ASSIGN_FORGET_TO_REVOKER_ONLY=true   # 数据集划分方式
 if [ "${ASSIGN_FORGET_TO_REVOKER_ONLY}" = "true" ]; then
   LOG_ROOT="logs/TOFU/fedperm_only"
   OUT_ROOT="saves/TOFU/fedperm_only"
@@ -38,7 +37,7 @@ fi
 
 REVOKER_CLIENT_IDX=0
 
-GLOBAL_ROUNDS=5
+GLOBAL_ROUNDS=2
 SAVE_INTERVAL=0              # 0 表示每轮保存；1 表示间隔一轮保存（1,3,5...），以此类推
 
 SEED=42
