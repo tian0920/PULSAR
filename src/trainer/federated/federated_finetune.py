@@ -622,9 +622,9 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         
         if self.is_peft:
             logger.info(f"Saving PEFT model to {output_dir}")
-            self.model.save_pretrained(output_dir)
+            self.model.save_pretrained(output_dir, safe_serialization=False)
             if self.tokenizer is not None:
-                self.tokenizer.save_pretrained(output_dir)
+                self.tokenizer.save_pretrained(output_dir, safe_serialization=False)
         else:
             super().save_model(output_dir)
 

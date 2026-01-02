@@ -128,7 +128,7 @@ run_eval_common() {
 
 # Client split sync (full script variant: baseline may be empty, current must exist).
 sync_client_splits_full() {
-  local src_dir="$1/client_splits"
+  local src_dir="$1"
   if [ ! -d "${src_dir}" ]; then
     echo "⚠️ 未找到客户端划分目录：${src_dir}"
     return
@@ -189,7 +189,7 @@ PY
 
 # Client split sync (retain script variant: baseline must contain all current files).
 sync_client_splits_retain() {
-  local src_dir="$1/client_splits"
+  local src_dir="$1"
   if [ ! -d "${src_dir}" ]; then
     echo "⚠️ 未找到客户端划分目录：${src_dir}"
     return

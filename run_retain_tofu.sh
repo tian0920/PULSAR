@@ -21,7 +21,6 @@ else
 fi
 
 ########################################
-
 MODELS=("Llama-3.2-1B-Instruct-lora")
 
 FORGET_SPLITS=("forget10")
@@ -174,7 +173,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       fi
 
       # 对齐公共划分
-      sync_client_splits "${RETAIN_DIR}"
+      sync_client_splits "${COMMON_SPLIT_DIR}"
 
       # 根据保存频次裁剪 checkpoint
       prune_rounds "${RETAIN_DIR}" "${GLOBAL_ROUNDS}" "${SAVE_INTERVAL}"
