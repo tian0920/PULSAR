@@ -17,13 +17,13 @@ source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 FL_METHOD="${FL_METHOD:-FedAvg}"
 DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff" "NPO" "SimNPO")
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
-GPU_COUNT="${GPU_COUNT:-1}"
-if [ "${GPU_COUNT}" -gt 1 ]; then
-  LAUNCHER=(torchrun --standalone --nproc_per_node="${GPU_COUNT}")
-  echo "Using multi-GPU launcher: ${LAUNCHER[*]}"
+LAUNCHER=(python)
+CLIENT_DEVICES="${CLIENT_DEVICES:-}"
+if [ -n "${CLIENT_DEVICES}" ]; then
+  export FEDPERM_CLIENT_DEVICES="${CLIENT_DEVICES}"
+  echo "Using single-process multi-GPU with devices: ${FEDPERM_CLIENT_DEVICES}"
 else
-  LAUNCHER=(python)
-  echo "Using single-GPU launcher: ${LAUNCHER[*]}"
+  echo "Using single-process launcher (set CLIENT_DEVICES=\"0,1,...\" to pin GPUs)"
 fi
 
 while [[ $# -gt 0 ]]; do

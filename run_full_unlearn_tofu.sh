@@ -10,13 +10,14 @@ source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 FL_METHOD="${FL_METHOD:-FedAvg}"
 DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff" "NPO" "SimNPO")
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
-GPU_COUNT="${GPU_COUNT:-1}"
-if [ "${GPU_COUNT}" -gt 1 ]; then
-  LAUNCHER=(torchrun --standalone --nproc_per_node="${GPU_COUNT}")
-  echo "Using multi-GPU launcher: ${LAUNCHER[*]}"
+# 单进程多 GPU：无需 torchrun，内部线程池按 FEDPERM_CLIENT_DEVICES 分配 GPU
+LAUNCHER=(python)
+CLIENT_DEVICES="${CLIENT_DEVICES:-}"
+if [ -n "${CLIENT_DEVICES}" ]; then
+  export FEDPERM_CLIENT_DEVICES="${CLIENT_DEVICES}"
+  echo "Using single-process multi-GPU with devices: ${FEDPERM_CLIENT_DEVICES}"
 else
-  LAUNCHER=(python)
-  echo "Using single-GPU launcher: ${LAUNCHER[*]}"
+  echo "Using single-process launcher (set CLIENT_DEVICES=\"0,1,...\" to pin GPUs)"
 fi
 
 while [[ $# -gt 0 ]]; do
@@ -300,17 +301,21 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         fi
       fi
 
-      # 预留 full 阶段最后一轮的 server pre（用于遗忘阶段 filter 基线），避免后续裁剪被删除
+      # 预留 filter 基线：取“最后一轮开始时”服务器下发的模型 = 上一轮聚合产物
       FILTER_BASE_DIR=""
-      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS))
+      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS - 1))
       if [ ${PRE_BASE_ROUND} -ge 1 ]; then
         PRE_BASE_SRC="${FULL_DIR}/round_${PRE_BASE_ROUND}"
-        FILTER_BASE_DIR="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_server_pre_base"
-        if [ -d "${PRE_BASE_SRC}" ] && [ ! -d "${FILTER_BASE_DIR}" ]; then
-          echo "Preserve filter base from ${PRE_BASE_SRC} to ${FILTER_BASE_DIR}"
-          mkdir -p "${FILTER_BASE_DIR}"
-          # 仅拷贝内容，避免产生 round_x 嵌套目录
-          cp -r "${PRE_BASE_SRC}/." "${FILTER_BASE_DIR}/"
+        FILTER_BASE_DIR="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_server_pre"
+        if [ -d "${PRE_BASE_SRC}" ]; then
+          if [ ! -d "${FILTER_BASE_DIR}" ] || [ -z "$(ls -A "${FILTER_BASE_DIR}")" ]; then
+            echo "Preserve filter base (start of last round) from ${PRE_BASE_SRC} to ${FILTER_BASE_DIR}"
+            mkdir -p "${FILTER_BASE_DIR}"
+            # 仅拷贝内容，避免产生 round_x 嵌套目录
+            cp -r "${PRE_BASE_SRC}/." "${FILTER_BASE_DIR}/"
+          fi
+        else
+          echo "⚠️ 缺少 filter 基线源目录：${PRE_BASE_SRC}"
         fi
       fi
 

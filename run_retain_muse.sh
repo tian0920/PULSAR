@@ -10,15 +10,14 @@ source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 FL_METHOD="${FL_METHOD:-FedAvg}"
 IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 
-# 单卡/多卡开关：GPU_COUNT=1 默认单卡；>1 时使用 torchrun 多卡
-GPU_COUNT="${GPU_COUNT:-2}"
-
-if [ "${GPU_COUNT}" -gt 1 ]; then
-  LAUNCHER=(torchrun --standalone --nproc_per_node="${GPU_COUNT}")
-  echo "Using multi-GPU launcher: ${LAUNCHER[*]}"
+# 单进程多 GPU：无需 torchrun，内部线程池按 FEDPERM_CLIENT_DEVICES 分配 GPU
+LAUNCHER=(python)
+CLIENT_DEVICES="${CLIENT_DEVICES:-}"
+if [ -n "${CLIENT_DEVICES}" ]; then
+  export FEDPERM_CLIENT_DEVICES="${CLIENT_DEVICES}"
+  echo "Using single-process multi-GPU with devices: ${FEDPERM_CLIENT_DEVICES}"
 else
-  LAUNCHER=(python)
-  echo "Using single-GPU launcher: ${LAUNCHER[*]}"
+  echo "Using single-process launcher (set CLIENT_DEVICES=\"0,1,...\" to pin GPUs)"
 fi
 
 ########################################
