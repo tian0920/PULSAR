@@ -382,15 +382,15 @@ class FederatedPermTrainer(FinetuneTrainer):
                 if self.is_peft:
                     logger.info(f"Saving target client {self.target_client_idx} PEFT model to {target_client_save_path}")
                     target_client_model = target_client_model.cpu()
-                    target_client_model.save_pretrained(target_client_save_path)
+                    target_client_model.save_pretrained(target_client_save_path, safe_serialization=False)
                     if self.tokenizer is not None:
-                        self.tokenizer.save_pretrained(target_client_save_path)
+                        self.tokenizer.save_pretrained(target_client_save_path, safe_serialization=False)
                 else:
                     # For non-PEFT models, save using standard method
                     target_client_model = target_client_model.cpu()
                     torch.save(target_client_model.state_dict(), os.path.join(target_client_save_path, "pytorch_model.bin"))
                     if self.tokenizer is not None:
-                        self.tokenizer.save_pretrained(target_client_save_path)
+                        self.tokenizer.save_pretrained(target_client_save_path, safe_serialization=False)
                 
                 logger.info(f"Target client {self.target_client_idx} model saved at {target_client_save_path}")
         
@@ -410,14 +410,14 @@ class FederatedPermTrainer(FinetuneTrainer):
             if self.is_peft:
                 logger.info(f"Saving final target client {self.target_client_idx} PEFT model to {final_target_client_path}")
                 target_client_model = target_client_model.cpu()
-                target_client_model.save_pretrained(final_target_client_path)
+                target_client_model.save_pretrained(final_target_client_path, safe_serialization=False)
                 if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(final_target_client_path)
+                    self.tokenizer.save_pretrained(final_target_client_path, safe_serialization=False)
             else:
                 target_client_model = target_client_model.cpu()
                 torch.save(target_client_model.state_dict(), os.path.join(final_target_client_path, "pytorch_model.bin"))
                 if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(final_target_client_path)
+                    self.tokenizer.save_pretrained(final_target_client_path, safe_serialization=False)
             
             logger.info(f"Final target client {self.target_client_idx} model saved at {final_target_client_path}")
         
@@ -1110,9 +1110,9 @@ class FederatedPermTrainer(FinetuneTrainer):
 
         if self.is_peft:
             logger.info(f"Saving PEFT model to {output_dir}")
-            self.model.save_pretrained(output_dir)
+            self.model.save_pretrained(output_dir, safe_serialization=False)
             if self.tokenizer is not None:
-                self.tokenizer.save_pretrained(output_dir)
+                self.tokenizer.save_pretrained(output_dir, safe_serialization=False)
         else:
             super().save_model(output_dir)
 

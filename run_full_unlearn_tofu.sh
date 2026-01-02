@@ -224,7 +224,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       SAVE_INTERVAL=${FULL_SAVE_INTERVAL}
       FULL_TASK="full_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}"
       FULL_DIR="${OUT_ROOT}/${FULL_TASK}"
-      CLIENT_SPLIT_DIR="saves/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}/client_splits"
+      CLIENT_SPLIT_DIR="saves/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
       mkdir -p "${FULL_DIR}"
 
       if training_complete "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}"; then
@@ -285,6 +285,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         FILTER_BASE_DIR="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_server_pre_base"
         if [ -d "${PRE_BASE_SRC}" ] && [ ! -d "${FILTER_BASE_DIR}" ]; then
           echo "Preserve filter base from ${PRE_BASE_SRC} to ${FILTER_BASE_DIR}"
+          mkdir -p "${FILTER_BASE_DIR}"
           cp -r "${PRE_BASE_SRC}" "${FILTER_BASE_DIR}"
         fi
       fi
@@ -295,7 +296,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
 
       eval_final_round "${FULL_DIR}" "${FULL_TASK}"
       # 对齐并冻结客户端划分，生成全局 retain/forget 索引
-      sync_client_splits "${FULL_DIR}"
+      sync_client_splits "${COMMON_SPLIT_DIR}"
 
       ########################################
       # 阶段 2：基于 full 模型的 FedPerm 遗忘 + 恢复（每轮评测）

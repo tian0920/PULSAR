@@ -101,7 +101,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
   ############################
   RETAIN_TASK="retain_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}"
   RETAIN_DIR="${OUT_ROOT}/${RETAIN_TASK}"
-  CLIENT_SPLIT_DIR="saves/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}/client_splits"
+  CLIENT_SPLIT_DIR="saves/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
   FORGET_IDX_PATH="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
   mkdir -p "${RETAIN_DIR}"
 
@@ -151,7 +151,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
   fi
 
   # 对齐公共划分
-  sync_client_splits "${RETAIN_DIR}"
+  sync_client_splits "${COMMON_SPLIT_DIR}"
 
   # 根据保存频次裁剪 checkpoint
   prune_rounds "${RETAIN_DIR}" "${GLOBAL_ROUNDS}" "${SAVE_INTERVAL}"

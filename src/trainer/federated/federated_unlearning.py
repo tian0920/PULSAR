@@ -149,16 +149,16 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             os.makedirs(pre_retain_target_path, exist_ok=True)
             tgt_model = unlearn_trainer.model.cpu()
             if self.is_peft:
-                tgt_model.save_pretrained(pre_retain_target_path)
+                tgt_model.save_pretrained(pre_retain_target_path, safe_serialization=False)
                 if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(pre_retain_target_path)
+                    self.tokenizer.save_pretrained(pre_retain_target_path, safe_serialization=False)
             else:
                 torch.save(
                     tgt_model.state_dict(),
                     os.path.join(pre_retain_target_path, "pytorch_model.bin"),
                 )
                 if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(pre_retain_target_path)
+                    self.tokenizer.save_pretrained(pre_retain_target_path, safe_serialization=False)
             logger.info(
                 f"Saved pre-retain target client {self.target_client_idx} model at {pre_retain_target_path}"
             )
@@ -231,16 +231,16 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 logger.info(
                     f"Saving final target client {self.target_client_idx} PEFT model to {final_target_client_path}"
                 )
-                target_model.save_pretrained(final_target_client_path)
+                target_model.save_pretrained(final_target_client_path, safe_serialization=False)
                 if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(final_target_client_path)
+                    self.tokenizer.save_pretrained(final_target_client_path, safe_serialization=False)
             else:
                 torch.save(
                     target_model.state_dict(),
                     os.path.join(final_target_client_path, "pytorch_model.bin"),
                 )
                 if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(final_target_client_path)
+                    self.tokenizer.save_pretrained(final_target_client_path, safe_serialization=False)
             logger.info(
                 f"Final target client {self.target_client_idx} model saved at {final_target_client_path}"
             )
