@@ -15,6 +15,7 @@ output*/
 saves*/
 wandb*/
 *.png
+*_cuda*.sh
 
 # Byte-Compiled / Optimized / DLL Files
 __pycache__/

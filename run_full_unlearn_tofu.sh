@@ -41,8 +41,7 @@ IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 ########################################
 # 公共配置
 ########################################
-# MODELS=("Llama-3.2-3B-Instruct-lora")
-MODELS=("Qwen2.5-1.5B-Instruct-lora")
+MODELS=("Llama-3.2-1B-Instruct-lora")
 
 FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
@@ -225,7 +224,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       SAVE_INTERVAL=${FULL_SAVE_INTERVAL}
       FULL_TASK="full_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}"
       FULL_DIR="${OUT_ROOT}/${FULL_TASK}"
-      CLIENT_SPLIT_DIR="${FULL_DIR}/client_splits"
+      CLIENT_SPLIT_DIR="saves/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}/client_splits"
       mkdir -p "${FULL_DIR}"
 
       if training_complete "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}"; then

@@ -12,7 +12,6 @@ IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 
 ########################################
-
 MODELS=("Llama-3.2-1B-Instruct-lora")
 
 FORGET_SPLIT="forget10"
@@ -102,7 +101,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
   ############################
   RETAIN_TASK="retain_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}"
   RETAIN_DIR="${OUT_ROOT}/${RETAIN_TASK}"
-  CLIENT_SPLIT_DIR="${RETAIN_DIR}/client_splits"
+  CLIENT_SPLIT_DIR="saves/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}/client_splits"
   FORGET_IDX_PATH="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
   mkdir -p "${RETAIN_DIR}"
 
