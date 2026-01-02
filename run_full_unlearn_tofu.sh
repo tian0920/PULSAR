@@ -41,7 +41,8 @@ IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 ########################################
 # 公共配置
 ########################################
-MODELS=("Llama-3.2-1B-Instruct-lora")
+# MODELS=("Llama-3.2-3B-Instruct-lora")
+MODELS=("Qwen2.5-1.5B-Instruct-lora")
 
 FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
