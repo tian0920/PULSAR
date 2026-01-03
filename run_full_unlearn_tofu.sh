@@ -235,7 +235,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
       mkdir -p "${FULL_DIR}"
 
-      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS))
+      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS - 1))
       PRE_BASE_SRC="${FULL_DIR}/round_${PRE_BASE_ROUND}"
 
       if training_complete "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}"; then
