@@ -107,8 +107,14 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
 
         self.model = self.model.cpu()
         self.model = deepcopy(self.model)
-        
-        for round_idx in range(self.global_rounds):
+        start_round = self._resume_from_existing_rounds()
+        if start_round >= self.global_rounds:
+            logger.info("All required rounds already exist; skip federated finetune loop.")
+            return None
+        if start_round > 0:
+            logger.info(f"Resuming federated finetune from round {start_round + 1}")
+
+        for round_idx in range(start_round, self.global_rounds):
             logger.info(f"Starting global round {round_idx + 1}/{self.global_rounds}")
             
             # Server-side eval before broadcasting (聚合前评测)
@@ -632,3 +638,71 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 return client_data.forget
             return getattr(client_data, "full", client_data)
         return client_data
+
+    def _resume_from_existing_rounds(self) -> int:
+        """
+        Locate the latest non-empty round_* under output_dir and warm start from it.
+        Returns the number of completed rounds (0-index for loop start).
+        """
+        latest_round = self._find_latest_round(self.args.output_dir, self.global_rounds)
+        if latest_round is None:
+            return 0
+
+        try:
+            self._load_round_model(latest_round)
+            logger.info(f"Loaded checkpoint from round_{latest_round} as resume baseline")
+            return latest_round
+        except Exception as exc:
+            logger.warning(f"Failed to load round_{latest_round} checkpoint, restart from scratch: {exc}")
+            return 0
+
+    @staticmethod
+    def _find_latest_round(base_dir: str, max_rounds: int) -> Optional[int]:
+        for r in range(max_rounds, 0, -1):
+            rdir = os.path.join(base_dir, f"round_{r}")
+            if os.path.isdir(rdir) and os.listdir(rdir):
+                return r
+        return None
+
+    def _load_round_model(self, round_idx: int):
+        round_dir = os.path.join(self.args.output_dir, f"round_{round_idx}")
+        if self.is_peft:
+            state_dict = self._load_peft_state(round_dir, f"round_{round_idx}")
+            set_peft_model_state_dict(self.model, state_dict)
+        else:
+            weight_path = os.path.join(round_dir, "pytorch_model.bin")
+            if not os.path.isfile(weight_path):
+                raise FileNotFoundError(f"pytorch_model.bin not found in {round_dir}")
+            state_dict = torch.load(weight_path, map_location="cpu")
+            self.model.load_state_dict(state_dict)
+        self.model = self.model.cpu()
+
+    def _load_peft_state(self, base_path: str, context: str):
+        """
+        Load a PEFT adapter state; prefer adapter_model.safetensors, fallback to adapter_model.bin.
+        """
+        if not os.path.isdir(base_path):
+            raise FileNotFoundError(f"{context} path not found: {base_path}")
+
+        bin_path = os.path.join(base_path, "adapter_model.bin")
+        safetensors_path = os.path.join(base_path, "adapter_model.safetensors")
+
+        if os.path.isfile(safetensors_path):
+            try:
+                from safetensors.torch import load_file
+            except Exception as exc:
+                raise ImportError(f"Failed to import safetensors for {context}: {exc}") from exc
+            try:
+                return load_file(safetensors_path, device="cpu")
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load adapter_model.safetensors for {context}: {exc}") from exc
+
+        if os.path.isfile(bin_path):
+            try:
+                return torch.load(bin_path, map_location="cpu")
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load adapter_model.bin for {context}: {exc}") from exc
+
+        raise FileNotFoundError(
+            f"adapter_model.[safetensors|bin] not found in {base_path} for {context}"
+        )

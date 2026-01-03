@@ -144,13 +144,19 @@ class FederatedPermTrainer(FinetuneTrainer):
         
         self.model = self.model.cpu()
         self.model = deepcopy(self.model)
+        start_round = self._resume_from_existing_rounds()
+        if start_round >= self.global_rounds:
+            logger.info("All required rounds already exist; skip FedPerm loop.")
+            return None
+        if start_round > 0:
+            logger.info(f"Resuming FedPerm from round {start_round + 1}")
         # Try to preload target client's previous post model for prev-CE
         if self.prev_target_model_post is None and self.prev_target_model_path:
             self.prev_target_model_post = self._load_prev_target_model(self.prev_target_model_path)
         
         self._should_trigger_revocation = False
 
-        for round_idx in range(self.global_rounds):
+        for round_idx in range(start_round, self.global_rounds):
             logger.info(f"Starting global round {round_idx + 1}/{self.global_rounds}")
 
             # Decide current阶段：遗忘/恢复/正常
@@ -964,6 +970,60 @@ class FederatedPermTrainer(FinetuneTrainer):
             model.save_pretrained(output_dir, safe_serialization=False)
         else:
             torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+
+    def _resume_from_existing_rounds(self) -> int:
+        """
+        Locate the latest non-empty round_* under output_dir and warm start from it.
+        Returns the number of completed rounds (0-index for loop start).
+        """
+        latest_round = self._find_latest_round(self.args.output_dir, self.global_rounds)
+        if latest_round is None:
+            return 0
+
+        try:
+            self._load_round_model(latest_round)
+            self._load_prev_target_from_round(latest_round)
+            logger.info(f"Loaded checkpoint from round_{latest_round} as resume baseline")
+            return latest_round
+        except Exception as exc:
+            logger.warning(f"Failed to load round_{latest_round} checkpoint, restart from scratch: {exc}")
+            return 0
+
+    @staticmethod
+    def _find_latest_round(base_dir: str, max_rounds: int) -> Optional[int]:
+        for r in range(max_rounds, 0, -1):
+            rdir = os.path.join(base_dir, f"round_{r}")
+            if os.path.isdir(rdir) and os.listdir(rdir):
+                return r
+        return None
+
+    def _load_round_model(self, round_idx: int):
+        round_dir = os.path.join(self.args.output_dir, f"round_{round_idx}")
+        if self.is_peft:
+            state_dict = self._load_peft_state(round_dir, f"round_{round_idx}")
+            set_peft_model_state_dict(self.model, state_dict)
+        else:
+            weight_path = os.path.join(round_dir, "pytorch_model.bin")
+            if not os.path.isfile(weight_path):
+                raise FileNotFoundError(f"pytorch_model.bin not found in {round_dir}")
+            state_dict = torch.load(weight_path, map_location="cpu")
+            self.model.load_state_dict(state_dict)
+        self.model = self.model.cpu()
+
+    def _load_prev_target_from_round(self, round_idx: int):
+        """
+        Try to hydrate prev_target_model_post from round-specific target checkpoint.
+        """
+        target_dir = os.path.join(
+            self.args.output_dir,
+            f"round_{round_idx}_target_client_{self.target_client_idx}",
+        )
+        if not os.path.isdir(target_dir):
+            return
+        try:
+            self.prev_target_model_post = self._load_prev_target_model(target_dir)
+        except Exception as exc:
+            logger.warning(f"Failed to load target client model from {target_dir}: {exc}")
 
 
     def _aggregate_with_alignment(self, round_idx: int, initial_states: List, updated_states: List, global_state: Dict):
