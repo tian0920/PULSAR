@@ -11,13 +11,8 @@ FL_METHOD="${FL_METHOD:-FedAvg}"
 DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff" "NPO" "SimNPO")
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
-CLIENT_DEVICES="${CLIENT_DEVICES:-}"
-if [ -n "${CLIENT_DEVICES}" ]; then
-  export FEDPERM_CLIENT_DEVICES="${CLIENT_DEVICES}"
-  echo "Using per-client subprocesses on devices: ${FEDPERM_CLIENT_DEVICES}"
-else
-  echo "Using per-client subprocesses; set CLIENT_DEVICES=\"0,1,...\" to choose GPUs"
-fi
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+echo "Single-GPU mode; using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 # 禁用 SDPA/flash，避免多卡下的 kernel 问题
 export PYTORCH_SDPA_ENABLE_FLASH=0
 export PYTORCH_SDPA_ENABLE_MEM_EFFICIENT=0
@@ -74,14 +69,14 @@ CLIENT_C_IDX=2
 ENABLE_PERMUTATION=false    # 神经元转置
 
 # full 阶段
-FULL_GLOBAL_ROUNDS=2
+FULL_GLOBAL_ROUNDS=10
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
 
 # 遗忘+恢复阶段（沿用 run_fedperm_only 的编排）
-UNLEARN_GLOBAL_ROUNDS=2
+UNLEARN_GLOBAL_ROUNDS=5
 NORMAL_BEFORE_FORGET=0
-FORGET_ROUNDS=1
-RECOVERY_START=1
+FORGET_ROUNDS=4
+RECOVERY_START=4
 UNLEARN_SAVE_INTERVAL=0  # unlearn 阶段：同上
 
 UNLEARN_EPOCHS=1   # 过滤器训练轮次

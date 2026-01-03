@@ -1,8 +1,7 @@
 #!/bin/bash
 
-
-export MASTER_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
-echo "Master Port: $MASTER_PORT"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+echo "Single-GPU mode with CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 models=(
     "Llama-3.2-1B-Instruct"
@@ -22,8 +21,7 @@ splits=(
     "forget10 holdout10 retain90"
 )
 
-
-per_device_train_batch_size=4 # on two gpus would make effective batch size 32
+per_device_train_batch_size=4 # effective batch size 16 with gradient_accumulation_steps=4 on a single GPU
 gradient_accumulation_steps=4
 
 
@@ -47,8 +45,7 @@ for split in "${splits[@]}"; do
             echo ${task_name}: Unlearning ${model_path} using ${trainer}
 
             # Unlearn
-            CUDA_VISIBLE_DEVICES=0,1 accelerate launch --config_file configs/accelerate/default_config.yaml --main_process_port $MASTER_PORT \
-            src/train.py --config-name=unlearn.yaml \
+            python src/train.py --config-name=unlearn.yaml \
             experiment=${experiment} \
             trainer=${trainer} \
             task_name=${task_name} \
@@ -59,11 +56,10 @@ for split in "${splits[@]}"; do
             retain_logs_path=saves/eval/tofu_${model}_${retain_split}/TOFU_EVAL.json \
             trainer.args.per_device_train_batch_size=$per_device_train_batch_size \
             trainer.args.gradient_accumulation_steps=$gradient_accumulation_steps \
-            trainer.args.ddp_find_unused_parameters=true \
             trainer.args.gradient_checkpointing=false
 
             # Eval
-            CUDA_VISIBLE_DEVICES=0 python src/eval.py \
+            python src/eval.py \
             experiment=eval/tofu/default.yaml \
             forget_split=${forget_split} \
             holdout_split=${holdout_split} \

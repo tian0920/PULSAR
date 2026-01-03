@@ -11,13 +11,8 @@ FL_METHOD="${FL_METHOD:-FedAvg}"
 IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 LAUNCHER=(python)
-CLIENT_DEVICES="${CLIENT_DEVICES:-}"
-if [ -n "${CLIENT_DEVICES}" ]; then
-  export FEDPERM_CLIENT_DEVICES="${CLIENT_DEVICES}"
-  echo "Using per-client subprocesses on devices: ${FEDPERM_CLIENT_DEVICES}"
-else
-  echo "Using per-client subprocesses; set CLIENT_DEVICES=\"0,1,...\" to choose GPUs"
-fi
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+echo "Single-GPU mode; using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 ########################################
 MODELS=("Llama-3.2-1B-Instruct-lora")

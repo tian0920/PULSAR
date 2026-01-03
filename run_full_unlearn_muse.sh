@@ -18,13 +18,8 @@ FL_METHOD="${FL_METHOD:-FedAvg}"
 DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff" "NPO" "SimNPO")
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
-CLIENT_DEVICES="${CLIENT_DEVICES:-}"
-if [ -n "${CLIENT_DEVICES}" ]; then
-  export FEDPERM_CLIENT_DEVICES="${CLIENT_DEVICES}"
-  echo "Using per-client subprocesses on devices: ${FEDPERM_CLIENT_DEVICES}"
-else
-  echo "Using per-client subprocesses; set CLIENT_DEVICES=\"0,1,...\" to choose GPUs"
-fi
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+echo "Single-GPU mode; using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
