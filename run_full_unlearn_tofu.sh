@@ -263,8 +263,8 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         SAVE_SPLITS_FOR_EVAL=true
         if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
           EXTRA_EVAL_ARGS+=(
-            eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
-            eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
+            ++eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
+            ++eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
           )
         fi
         # 若公共划分已存在，直接复用，不再生成新划分
@@ -356,8 +356,8 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           EXTRA_EVAL_ARGS=()
           if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
             EXTRA_EVAL_ARGS+=(
-              eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
-              eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
+              ++eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
+              ++eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
             )
           fi
 

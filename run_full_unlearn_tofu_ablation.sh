@@ -72,7 +72,7 @@ CLIENT_C_IDX=2
 ENABLE_PERMUTATION=false    # 神经元转置
 
 # full 阶段
-FULL_GLOBAL_ROUNDS=2
+FULL_GLOBAL_ROUNDS=10
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
 
 # 遗忘+恢复阶段（沿用 run_fedperm_only 的编排）
@@ -88,10 +88,14 @@ FILTER_ALPHA=1     # θ_g^t-(θ_g^{t-1}-alpha*θ_unlearn)
 # 遗忘阶段目标客户端B本地LOSS正则锚点/双CE开关
 TARGET_ANCHOR_REG_ENABLED=false
 TARGET_ANCHOR_REG_LAMBDA=1
-# 遗忘阶段 filter/DCE 组合：由 enable_revocation 控制是否启用 filter
-ENABLE_REVOCATION="${ENABLE_REVOCATION:-true}"           # true: 开启遗忘/过滤；false: 不触发 revocation/filter
-USE_TARGET_PREV_CE="${USE_TARGET_PREV_CE:-true}"         # true: client1 开启 prev-CE (双CE)
-TARGET_PREV_CE_WEIGHT=1.0     # θ_unlearn的微调项系数（仅在 USE_TARGET_PREV_CE=true 时生效）
+# 遗忘阶段 filter/DCE 组合：脚本自动跑三种 ablation
+TARGET_PREV_CE_WEIGHT=1.0     # θ_unlearn的微调项系数（仅在开启 prev-CE 时生效）
+# tag:enable_revocation:use_target_prev_ce
+TARGET_ABLATIONS=(
+  "global:false:false"
+  "fliter:true:false"
+  "fliter_DCE:true:true"
+)
 
 SEED=42
 
@@ -264,8 +268,8 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         SAVE_SPLITS_FOR_EVAL=true
         if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
           EXTRA_EVAL_ARGS+=(
-            eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
-            eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
+            ++eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
+            ++eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
           )
         fi
         # 若公共划分已存在，直接复用，不再生成新划分
@@ -347,82 +351,77 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       for UNLEARN_METHOD in "${UNLEARN_CLS[@]}"; do
         echo "------- UNLEARN_METHOD=${UNLEARN_METHOD} -------"
 
-        TARGET_PREV_CE="${USE_TARGET_PREV_CE}"
-        if [ "${ENABLE_REVOCATION}" != "true" ]; then
-          TARGET_EVAL_TAG="global"
-        elif [ "${TARGET_PREV_CE}" = "true" ]; then
-          TARGET_EVAL_TAG="fliter+DCE"
-        else
-          TARGET_EVAL_TAG="fliter"
-        fi
-        TARGET_EVAL_TAG_SAFE="${TARGET_EVAL_TAG//+/_}"
+        for TARGET_MODE in "${TARGET_ABLATIONS[@]}"; do
+          IFS=':' read -r TARGET_EVAL_TAG ENABLE_REVOCATION TARGET_PREV_CE <<< "${TARGET_MODE}"
 
-        FEDPERM_TASK="unlearn_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}_${UNLEARN_METHOD}_${TARGET_EVAL_TAG_SAFE}"
-        FEDPERM_DIR="${OUT_ROOT}/${FEDPERM_TASK}"
-        CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
-        mkdir -p "${FEDPERM_DIR}"
+          FEDPERM_TASK="unlearn_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}_${UNLEARN_METHOD}_${TARGET_EVAL_TAG}"
+          FEDPERM_DIR="${OUT_ROOT}/${FEDPERM_TASK}"
+          CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
+          mkdir -p "${FEDPERM_DIR}"
 
-        if training_complete "${FEDPERM_DIR}" "${UNLEARN_GLOBAL_ROUNDS}"; then
-          echo "Skip FedPerm unlearn, final round exists: ${FEDPERM_DIR}/round_${UNLEARN_GLOBAL_ROUNDS}"
-        else
-          EXTRA_EVAL_ARGS=()
-          if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
-            EXTRA_EVAL_ARGS+=(
-              eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
-              eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
-            )
+          echo ">>> TARGET_MODE=${TARGET_EVAL_TAG} (revocation=${ENABLE_REVOCATION}, prev_ce=${TARGET_PREV_CE})"
+
+          if training_complete "${FEDPERM_DIR}" "${UNLEARN_GLOBAL_ROUNDS}"; then
+            echo "Skip FedPerm unlearn, final round exists: ${FEDPERM_DIR}/round_${UNLEARN_GLOBAL_ROUNDS}"
+          else
+            EXTRA_EVAL_ARGS=()
+            if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
+              EXTRA_EVAL_ARGS+=(
+                ++eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
+                ++eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
+              )
+            fi
+
+            SKIP_ROUNDS=$(compute_skip_rounds "${UNLEARN_GLOBAL_ROUNDS}" "${UNLEARN_SAVE_INTERVAL}")
+            FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
+            FEDPERM_SKIP_SAVE_ROUNDS="${SKIP_ROUNDS}" \
+            "${LAUNCHER[@]}" src/federated_train.py \
+              --config-name="${CONFIG_TRAIN}" \
+              experiment=finetune/tofu/default \
+              model="${MODEL_CFG}" \
+              task_name="${FEDPERM_TASK}" \
+              trainer=FederatedPermTrainer \
+              trainer.method_args.enable_revocation="${ENABLE_REVOCATION}" \
+              trainer.method_args.global_rounds="${UNLEARN_GLOBAL_ROUNDS}" \
+              trainer.method_args.train_on="full" \
+              trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \
+              trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
+              trainer.method_args.unlearn_epochs="${UNLEARN_EPOCHS}" \
+              trainer.method_args.normal_rounds_before_forget="${NORMAL_BEFORE_FORGET}" \
+              trainer.method_args.forget_round_count="${FORGET_ROUNDS}" \
+              trainer.method_args.recovery_round_start="${RECOVERY_START}" \
+              trainer.method_args.filter_alpha="${FILTER_ALPHA}" \
+              trainer.method_args.save_client_splits_for_eval=false \
+              +trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}" \
+              +trainer.method_args.forget_indices_path="${FORGET_IDX_FILE}" \
+              trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
+              trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
+              trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
+              trainer.method_args.eval_client_c_idx="${CLIENT_C_IDX}" \
+              trainer.method_args.target_anchor_reg_enabled="${TARGET_ANCHOR_REG_ENABLED}" \
+              trainer.method_args.target_anchor_reg_lambda="${TARGET_ANCHOR_REG_LAMBDA}" \
+              trainer.method_args.target_prev_ce_enabled="${TARGET_PREV_CE}" \
+              trainer.method_args.target_prev_ce_weight="${TARGET_PREV_CE_WEIGHT}" \
+              +trainer.method_args.filter_base_model_path="${FILTER_BASE_DIR}" \
+              trainer.method_args.prev_target_model_path="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_target_client_${TARGET_CLIENT_IDX}" \
+              +trainer.method_args.enable_permutation="${ENABLE_PERMUTATION}" \
+              data/datasets@data.train=TOFU_QA_full \
+              data.train.TOFU_QA_full.args.hf_args.name=full \
+              model.model_args.pretrained_model_name_or_path="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}" \
+              trainer.args.output_dir="${FEDPERM_DIR}" \
+              trainer.args.save_strategy="epoch" \
+              paths.output_dir="${FEDPERM_DIR}" \
+              trainer.args.seed="${SEED}" \
+              "${EXTRA_EVAL_ARGS[@]}" \
+              2>&1 | tee "${LOG_ROOT}/${FEDPERM_TASK}.txt"
           fi
 
-          SKIP_ROUNDS=$(compute_skip_rounds "${UNLEARN_GLOBAL_ROUNDS}" "${UNLEARN_SAVE_INTERVAL}")
-          FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
-          FEDPERM_SKIP_SAVE_ROUNDS="${SKIP_ROUNDS}" \
-          "${LAUNCHER[@]}" src/federated_train.py \
-            --config-name="${CONFIG_TRAIN}" \
-            experiment=finetune/tofu/default \
-            model="${MODEL_CFG}" \
-            task_name="${FEDPERM_TASK}" \
-            trainer=FederatedPermTrainer \
-            trainer.method_args.enable_revocation="${ENABLE_REVOCATION}" \
-            trainer.method_args.global_rounds="${UNLEARN_GLOBAL_ROUNDS}" \
-            trainer.method_args.train_on="full" \
-            trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \
-            trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
-            trainer.method_args.unlearn_epochs="${UNLEARN_EPOCHS}" \
-            trainer.method_args.normal_rounds_before_forget="${NORMAL_BEFORE_FORGET}" \
-            trainer.method_args.forget_round_count="${FORGET_ROUNDS}" \
-            trainer.method_args.recovery_round_start="${RECOVERY_START}" \
-            trainer.method_args.filter_alpha="${FILTER_ALPHA}" \
-            trainer.method_args.save_client_splits_for_eval=false \
-            +trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}" \
-            +trainer.method_args.forget_indices_path="${FORGET_IDX_FILE}" \
-            trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
-            trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
-            trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
-            trainer.method_args.eval_client_c_idx="${CLIENT_C_IDX}" \
-            trainer.method_args.target_anchor_reg_enabled="${TARGET_ANCHOR_REG_ENABLED}" \
-            trainer.method_args.target_anchor_reg_lambda="${TARGET_ANCHOR_REG_LAMBDA}" \
-            trainer.method_args.target_prev_ce_enabled="${TARGET_PREV_CE}" \
-            trainer.method_args.target_prev_ce_weight="${TARGET_PREV_CE_WEIGHT}" \
-            +trainer.method_args.filter_base_model_path="${FILTER_BASE_DIR}" \
-            trainer.method_args.prev_target_model_path="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_target_client_${TARGET_CLIENT_IDX}" \
-            +trainer.method_args.enable_permutation="${ENABLE_PERMUTATION}" \
-            trainer.method_args.target_eval_tag="${TARGET_EVAL_TAG}" \
-            data/datasets@data.train=TOFU_QA_full \
-            data.train.TOFU_QA_full.args.hf_args.name=full \
-            model.model_args.pretrained_model_name_or_path="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}" \
-            trainer.args.output_dir="${FEDPERM_DIR}" \
-            trainer.args.save_strategy="epoch" \
-            paths.output_dir="${FEDPERM_DIR}" \
-            trainer.args.seed="${SEED}" \
-            "${EXTRA_EVAL_ARGS[@]}" \
-            2>&1 | tee "${LOG_ROOT}/${FEDPERM_TASK}.txt"
-        fi
+          # 根据保存频次裁剪 checkpoint（保留最后一轮）
+          prune_rounds "${FEDPERM_DIR}" "${UNLEARN_GLOBAL_ROUNDS}" "${UNLEARN_SAVE_INTERVAL}"
+          SAVE_INTERVAL=${UNLEARN_SAVE_INTERVAL}
 
-        # 根据保存频次裁剪 checkpoint（保留最后一轮）
-        prune_rounds "${FEDPERM_DIR}" "${UNLEARN_GLOBAL_ROUNDS}" "${UNLEARN_SAVE_INTERVAL}"
-        SAVE_INTERVAL=${UNLEARN_SAVE_INTERVAL}
-
-        eval_rounds "${FEDPERM_DIR}" "${FEDPERM_TASK}"
+          eval_rounds "${FEDPERM_DIR}" "${FEDPERM_TASK}"
+        done
       done
 
     done

@@ -106,11 +106,8 @@ run_eval_common() {
     fi
     if [ -n "${forget_idx_path}" ] && [ -f "${forget_idx_path}" ]; then
       extra_args+=(
-        +eval.muse={}
-        +eval.tofu.forget_indices_path="${forget_idx_path}"
-        +eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
-        +eval.muse.forget_indices_path="${forget_idx_path}"
-        +eval.muse.forget_split="${FORGET_SPLIT}"
+        ++eval.tofu.forget_indices_path="${forget_idx_path}"
+        ++eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
       )
     fi
   fi
