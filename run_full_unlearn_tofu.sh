@@ -90,7 +90,7 @@ TARGET_ANCHOR_REG_ENABLED=false
 TARGET_ANCHOR_REG_LAMBDA=1
 
 TARGET_PREV_CE_ENABLED=true   # 目标客户端本地训练双CE开关
-TARGET_PREV_CE_WEIGHT=0     # θ_unlearn的微调项系数
+TARGET_PREV_CE_WEIGHT=1     # θ_unlearn的微调项系数
 
 SEED=42
 
