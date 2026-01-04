@@ -78,6 +78,7 @@ class FederatedPermTrainer(FinetuneTrainer):
         self.enable_revocation = enable_revocation
         self.revocation_round = revocation_round
         self.unlearn_epochs = unlearn_epochs
+        self.unlearn_trainer_cls = kwargs.get("unlearn_trainer_cls")
         self.enable_pre_eval = os.environ.get("ENABLE_PRE_EVAL", "false").lower() in (
             "1",
             "true",
@@ -627,8 +628,15 @@ class FederatedPermTrainer(FinetuneTrainer):
             unlearn_model = unlearn_model.to(self.filter_device)
 
         # 只用 forget 数据驱动过滤器：retain_loss 权重设为 0
-        unlearn_trainer = GradDiff(
-            alpha=0.0,
+        from trainer import TRAINER_REGISTRY
+        trainer_cls = TRAINER_REGISTRY.get(self.unlearn_trainer_cls, None)
+        if trainer_cls is None:
+            logger.warning(
+                f"Unrecognized unlearn_trainer_cls={self.unlearn_trainer_cls}; skip revocation for this round"
+            )
+            return
+
+        trainer_kwargs = dict(
             model=unlearn_model,
             train_dataset=forget_dataset,
             tokenizer=self.tokenizer,
@@ -637,8 +645,13 @@ class FederatedPermTrainer(FinetuneTrainer):
             evaluator=self.evaluator,
             template_args=self.template_args,
         )
+        # GradDiff expects alpha for forget-only training; others ignore it if not in signature.
+        if trainer_cls is GradDiff:
+            trainer_kwargs["alpha"] = 0.0
 
-        logger.info("Start unlearning training on Client A's data (GradDiff)...")
+        unlearn_trainer = trainer_cls(**trainer_kwargs)
+
+        logger.info(f"Start unlearning training on Client A's data ({trainer_cls.__name__})...")
         unlearn_trainer.train()
         logger.info("Unlearning training finished.")
         unlearn_model = unlearn_trainer.model.cpu()

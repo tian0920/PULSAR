@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvg}"
+FL_METHOD="${FL_METHOD:-FedAvgM}"
 DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff" "NPO" "SimNPO")
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
@@ -72,7 +72,7 @@ CLIENT_C_IDX=2
 ENABLE_PERMUTATION=false    # 神经元转置
 
 # full 阶段
-FULL_GLOBAL_ROUNDS=10
+FULL_GLOBAL_ROUNDS=2
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
 
 # 遗忘+恢复阶段（沿用 run_fedperm_only 的编排）
@@ -288,6 +288,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer=FederatedPermTrainer \
           trainer.method_args.enable_revocation=false \
           trainer.method_args.global_rounds="${FULL_GLOBAL_ROUNDS}" \
+          trainer.method_args.aggregation_strategy="${CURRENT_FL_METHOD}" \
           trainer.method_args.train_on="full" \
           trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \
           trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
@@ -380,6 +381,8 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
             trainer.method_args.forget_round_count="${FORGET_ROUNDS}" \
             trainer.method_args.recovery_round_start="${RECOVERY_START}" \
             trainer.method_args.filter_alpha="${FILTER_ALPHA}" \
+            trainer.method_args.unlearn_trainer_cls="${UNLEARN_METHOD}" \
+            trainer.method_args.aggregation_strategy="${CURRENT_FL_METHOD}" \
             trainer.method_args.save_client_splits_for_eval=false \
             +trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}" \
             +trainer.method_args.forget_indices_path="${FORGET_IDX_FILE}" \
