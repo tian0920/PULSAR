@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvgM}"
+FL_METHOD="${FL_METHOD:-FedAvg}"
 DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff" "NPO" "SimNPO")
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
@@ -72,7 +72,7 @@ CLIENT_C_IDX=2
 ENABLE_PERMUTATION=false    # 神经元转置
 
 # full 阶段
-FULL_GLOBAL_ROUNDS=2
+FULL_GLOBAL_ROUNDS=10
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
 
 # 遗忘+恢复阶段（沿用 run_fedperm_only 的编排）
@@ -90,7 +90,7 @@ TARGET_ANCHOR_REG_ENABLED=false
 TARGET_ANCHOR_REG_LAMBDA=1
 
 TARGET_PREV_CE_ENABLED=true   # 目标客户端本地训练双CE开关
-TARGET_PREV_CE_WEIGHT=1.0     # θ_unlearn的微调项系数
+TARGET_PREV_CE_WEIGHT=0     # θ_unlearn的微调项系数
 
 SEED=42
 
@@ -346,7 +346,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       SAVE_INTERVAL=${UNLEARN_SAVE_INTERVAL}
       for UNLEARN_METHOD in "${UNLEARN_CLS[@]}"; do
         echo "------- UNLEARN_METHOD=${UNLEARN_METHOD} -------"
-        FEDPERM_TASK="unlearn_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}_${UNLEARN_METHOD}_filter${UNLEARN_EPOCHS}_CE${TARGET_PREV_CE_WEIGHT}"
+        FEDPERM_TASK="unlearn_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}_${UNLEARN_METHOD}_filter${UNLEARN_EPOCHS}_CE${TARGET_PREV_CE_WEIGHT}_Alpha${FILTER_ALPHA}"
         FEDPERM_DIR="${OUT_ROOT}/${FEDPERM_TASK}"
         CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
         mkdir -p "${FEDPERM_DIR}"

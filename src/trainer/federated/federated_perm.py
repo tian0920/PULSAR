@@ -816,7 +816,7 @@ class FederatedPermTrainer(FinetuneTrainer):
                 if logits_student is None:
                     return (base_loss, outputs) if return_outputs else base_loss
 
-                def _teacher_loss(teacher_model):
+                def _teacher_logits(teacher_model):
                     was_training = teacher_model.training
                     teacher_model.eval()
                     t_device = next(teacher_model.parameters()).device
@@ -828,15 +828,35 @@ class FederatedPermTrainer(FinetuneTrainer):
                     with torch.no_grad():
                         t_inputs = {k: v.to(target_device) if torch.is_tensor(v) else v for k, v in inputs.items()}
                         t_out = teacher_model(**t_inputs)
-                        loss_t = t_out.loss
+                        t_logits = getattr(t_out, "logits", None)
                     if moved:
                         teacher_model = teacher_model.to(t_device)
                     if was_training:
                         teacher_model.train()
-                    return loss_t
+                    return t_logits
 
-                loss_prev = _teacher_loss(prev_teacher)
-                loss = base_loss + self.target_prev_ce_weight * loss_prev
+                teacher_logits = _teacher_logits(prev_teacher)
+                if teacher_logits is None:
+                    return (base_loss, outputs) if return_outputs else base_loss
+
+                teacher_logits = teacher_logits.to(logits_student.device).float()
+                student_logits = logits_student.float()
+
+                labels = inputs.get("labels") if isinstance(inputs, dict) else None
+                if labels is not None:
+                    valid_mask = labels != -100
+                    if valid_mask.any():
+                        teacher_logits = teacher_logits[valid_mask]
+                        student_logits = student_logits[valid_mask]
+                    else:
+                        return (base_loss, outputs) if return_outputs else base_loss
+
+                kd_loss = F.kl_div(
+                    F.log_softmax(student_logits, dim=-1),
+                    F.softmax(teacher_logits, dim=-1),
+                    reduction="batchmean",
+                )
+                loss = base_loss + self.target_prev_ce_weight * kd_loss
                 return (loss, outputs) if return_outputs else loss
 
             trainer.compute_loss = compute_loss_with_prev_teacher
