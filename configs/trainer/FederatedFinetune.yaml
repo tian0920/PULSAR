@@ -15,7 +15,7 @@ method_args:
 args:
   output_dir: saves/finetune/${task_name}
   logging_dir: ${trainer.args.output_dir}/logs
-  per_device_train_batch_size: 32  # Reduce batch size to lower memory usage
+  per_device_train_batch_size: 8  # Reduce batch size to lower memory usage
   per_device_eval_batch_size: 1   # Reduce evaluation batch size
   gradient_accumulation_steps: 1  # Increase gradient accumulation steps to maintain effective batch size
   learning_rate: 8e-5

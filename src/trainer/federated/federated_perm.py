@@ -78,6 +78,12 @@ class FederatedPermTrainer(FinetuneTrainer):
         self.enable_revocation = enable_revocation
         self.revocation_round = revocation_round
         self.unlearn_epochs = unlearn_epochs
+        self.enable_pre_eval = os.environ.get("ENABLE_PRE_EVAL", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         self.kwargs = kwargs
 
         # 轮次编排：默认前 4 轮正常训练，3 轮定向遗忘，剩余轮次恢复正常
@@ -186,11 +192,12 @@ class FederatedPermTrainer(FinetuneTrainer):
                 global_state = self.model.state_dict()
 
             # Server-side eval before broadcasting (聚合前评测)
-            self._maybe_evaluate_model(
-                model=self.model,
-                round_idx=round_idx,
-                stage="server_pre_agg",
-            )
+            if self.enable_pre_eval:
+                self._maybe_evaluate_model(
+                    model=self.model,
+                    round_idx=round_idx,
+                    stage="server_pre_agg",
+                )
             
             # Distribute models to clients
             self.client_data_sizes = []
@@ -236,7 +243,7 @@ class FederatedPermTrainer(FinetuneTrainer):
                 self.client_data_sizes.append(client_data_size)
 
                 # 训练前评测（逐客户端），A/C 可复用 server 结果，B 在遗忘阶段需要重新评测
-                if self._should_eval_client(client_idx):
+                if self.enable_pre_eval and self._should_eval_client(client_idx):
                     stage_name = f"client{client_idx}_pre_train"
                     if round_idx == 0:
                         reused = self._reuse_server_pre_eval(round_idx, stage_name, client_idx)
@@ -352,6 +359,11 @@ class FederatedPermTrainer(FinetuneTrainer):
         Run evaluator (if provided) and save SUMMARY.json for the given stage.
         """
         if self.evaluator is None:
+            return
+        if (stage.startswith("server_pre") or stage.endswith("_pre_train")) and not self.enable_pre_eval:
+            logger.info(
+                f"Skipping pre eval for stage {stage} due to ENABLE_PRE_EVAL={self.enable_pre_eval}"
+            )
             return
         # 允许通过环境变量跳过指定轮次的评测，以节省时间
         skip_rounds_env = os.environ.get("FEDPERM_SKIP_EVAL_ROUNDS", "")

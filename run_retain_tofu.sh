@@ -14,6 +14,9 @@ LAUNCHER=(python)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 echo "Single-GPU mode; using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
+# 是否运行+保存所有 pre 评测，默认关闭以节省时间
+ENABLE_PRE_EVAL="${ENABLE_PRE_EVAL:-false}"
+
 ########################################
 MODELS=("Llama-3.2-1B-Instruct-lora")
 
@@ -69,6 +72,13 @@ eval_rounds() {
     fi
     local pre_round=$((r-1))
     if [ ${pre_round} -ge 1 ]; then
+      if [ "${ENABLE_PRE_EVAL}" != "true" ]; then
+        if [ -z "${PRE_EVAL_SKIP_LOGGED:-}" ]; then
+          echo "Skip all pre evals because ENABLE_PRE_EVAL=${ENABLE_PRE_EVAL}"
+          PRE_EVAL_SKIP_LOGGED=true
+        fi
+        continue
+      fi
       local pre="${base_dir}/round_${pre_round}"
       if [ -d "${pre}" ]; then
         local pre_summary_paths=(

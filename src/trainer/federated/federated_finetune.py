@@ -35,6 +35,12 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         self.federated_dataset = train_dataset if isinstance(train_dataset, dict) else None
         self.train_on = train_on
         self.retain_ratio = retain_ratio
+        self.enable_pre_eval = os.environ.get("ENABLE_PRE_EVAL", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         dummy_train_dataset = None
         if self.federated_dataset and 0 in self.federated_dataset:
             dummy_train_dataset = self._select_train_dataset(self.federated_dataset[0])
@@ -118,11 +124,12 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
             logger.info(f"Starting global round {round_idx + 1}/{self.global_rounds}")
             
             # Server-side eval before broadcasting (聚合前评测)
-            self._maybe_evaluate_model(
-                model=self.model,
-                round_idx=round_idx,
-                stage="server_pre_agg",
-            )
+            if self.enable_pre_eval:
+                self._maybe_evaluate_model(
+                    model=self.model,
+                    round_idx=round_idx,
+                    stage="server_pre_agg",
+                )
 
             self.client_models = [deepcopy(self.model) for _ in range(self.num_clients)]
             self.client_data_sizes = []  
@@ -144,17 +151,18 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 self.client_data_sizes.append(client_data_size)
                 
                 # Client-side eval before local training：第 1 轮直接复用 server_pre_agg，其余轮次复用上一轮 server_post_agg
-                stage_name = f"client{client_idx}_pre_train"
-                if round_idx == 0:
-                    reused = self._reuse_server_pre_eval(round_idx, stage_name)
-                else:
-                    reused = self._reuse_server_post_eval(round_idx, stage_name)
-                if not reused:
-                    self._maybe_evaluate_model(
-                        model=client_model,
-                        round_idx=round_idx,
-                        stage=stage_name,
-                    )
+                if self.enable_pre_eval:
+                    stage_name = f"client{client_idx}_pre_train"
+                    if round_idx == 0:
+                        reused = self._reuse_server_pre_eval(round_idx, stage_name)
+                    else:
+                        reused = self._reuse_server_post_eval(round_idx, stage_name)
+                    if not reused:
+                        self._maybe_evaluate_model(
+                            model=client_model,
+                            round_idx=round_idx,
+                            stage=stage_name,
+                        )
 
                 client_idx, trained_client_model = self._train_client_task(
                     client_idx,
@@ -298,6 +306,11 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         Run evaluator (if provided) and save SUMMARY.json for the given stage.
         """
         if self.evaluator is None:
+            return
+        if (stage.startswith("server_pre") or stage.endswith("_pre_train")) and not self.enable_pre_eval:
+            logger.info(
+                f"Skipping pre eval for stage {stage} due to ENABLE_PRE_EVAL={self.enable_pre_eval}"
+            )
             return
         eval_dir = os.path.join(
             self.args.output_dir,
