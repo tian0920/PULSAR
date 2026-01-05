@@ -76,10 +76,10 @@ FULL_GLOBAL_ROUNDS=10
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
 
 # 遗忘+恢复阶段（沿用 run_fedperm_only 的编排）
-UNLEARN_GLOBAL_ROUNDS=5
+UNLEARN_GLOBAL_ROUNDS=10
 NORMAL_BEFORE_FORGET=0
-FORGET_ROUNDS=4
-RECOVERY_START=4
+FORGET_ROUNDS=5
+RECOVERY_START=5
 UNLEARN_SAVE_INTERVAL=0  # unlearn 阶段：同上
 
 UNLEARN_EPOCHS=1   # 过滤器训练轮次
@@ -91,6 +91,7 @@ TARGET_ANCHOR_REG_LAMBDA=1
 
 TARGET_PREV_CE_ENABLED=true   # 目标客户端本地训练双CE开关
 TARGET_PREV_CE_WEIGHT=1     # θ_unlearn的微调项系数
+RECOVERY_LR="${RECOVERY_LR:-5e-4}"  # 可选：恢复阶段单独学习率（为空则不覆盖）
 
 SEED=42
 
@@ -363,6 +364,10 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           fi
 
           SKIP_ROUNDS=$(compute_skip_rounds "${UNLEARN_GLOBAL_ROUNDS}" "${UNLEARN_SAVE_INTERVAL}")
+          RECOVERY_ARGS=()
+          if [ -n "${RECOVERY_LR}" ]; then
+            RECOVERY_ARGS+=(trainer.method_args.recovery_lr="${RECOVERY_LR}")
+          fi
           FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
           FEDPERM_SKIP_SAVE_ROUNDS="${SKIP_ROUNDS}" \
           "${LAUNCHER[@]}" src/federated_train.py \
@@ -394,6 +399,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
             trainer.method_args.target_anchor_reg_lambda="${TARGET_ANCHOR_REG_LAMBDA}" \
             trainer.method_args.target_prev_ce_enabled="${TARGET_PREV_CE_ENABLED}" \
             trainer.method_args.target_prev_ce_weight="${TARGET_PREV_CE_WEIGHT}" \
+            "${RECOVERY_ARGS[@]}" \
             +trainer.method_args.filter_base_model_path="${FILTER_BASE_DIR}" \
             trainer.method_args.prev_target_model_path="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_target_client_${TARGET_CLIENT_IDX}" \
             +trainer.method_args.enable_permutation="${ENABLE_PERMUTATION}" \

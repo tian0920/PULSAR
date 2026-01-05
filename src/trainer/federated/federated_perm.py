@@ -17,7 +17,8 @@ from transformers.trainer_utils import IntervalStrategy, SaveStrategy
 from peft import PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
 from trainer.unlearn.grad_diff import GradDiff
 from transformers import default_data_collator
-import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.nn.utils import clip_grad_norm_
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,8 @@ class FederatedPermTrainer(FinetuneTrainer):
             "yes",
             "on",
         )
+        self.base_learning_rate = getattr(self.args, "learning_rate", None)
+        self.recovery_learning_rate = kwargs.get("recovery_lr", None)
         self.kwargs = kwargs
 
         # 轮次编排：默认前 4 轮正常训练，3 轮定向遗忘，剩余轮次恢复正常
@@ -169,11 +172,17 @@ class FederatedPermTrainer(FinetuneTrainer):
             # Decide current阶段：遗忘/恢复/正常
             is_forget_round = self.enable_revocation and (round_idx in self.forget_rounds)
             recovery_due = (
-                self.revocation_status
-                and self.recovery_round_start is not None
+                self.recovery_round_start is not None
                 and round_idx >= self.recovery_round_start
                 and not is_forget_round
             )
+            # 动态切换恢复阶段学习率（若指定）
+            if recovery_due and self.recovery_learning_rate is not None:
+                if getattr(self.args, "learning_rate", None) != self.recovery_learning_rate:
+                    logger.info(f"Switch learning_rate to recovery_lr={self.recovery_learning_rate}")
+                self.args.learning_rate = self.recovery_learning_rate
+            else:
+                self.args.learning_rate = self.base_learning_rate
 
             # Activate / deactivate filter as needed
             if is_forget_round:
@@ -769,6 +778,7 @@ class FederatedPermTrainer(FinetuneTrainer):
             template_args=self.template_args,
         )
 
+        trained_model = None
         # 可选：为目标客户端 B 添加 L2 锚点正则，抑制遗忘后回弹
         if anchor_state is not None and anchor_lambda > 0:
             base_compute_loss = trainer.compute_loss
@@ -797,71 +807,20 @@ class FederatedPermTrainer(FinetuneTrainer):
                 return (loss, outputs) if return_outputs else loss
 
             trainer.compute_loss = compute_loss_with_anchor
-        elif prev_teacher is not None:
-            base_compute_loss = trainer.compute_loss
-
-            def compute_loss_with_prev_teacher(model, inputs, return_outputs=False, num_items_in_batch=None):
-                result = base_compute_loss(
-                    model,
-                    inputs,
-                    return_outputs=True,
-                    num_items_in_batch=num_items_in_batch,
-                )
-                if isinstance(result, tuple):
-                    base_loss, outputs = result
-                else:
-                    base_loss, outputs = result, None
-
-                logits_student = outputs.logits if outputs is not None else None
-                if logits_student is None:
-                    return (base_loss, outputs) if return_outputs else base_loss
-
-                def _teacher_logits(teacher_model):
-                    was_training = teacher_model.training
-                    teacher_model.eval()
-                    t_device = next(teacher_model.parameters()).device
-                    target_device = logits_student.device
-                    moved = False
-                    if t_device != target_device:
-                        teacher_model = teacher_model.to(target_device)
-                        moved = True
-                    with torch.no_grad():
-                        t_inputs = {k: v.to(target_device) if torch.is_tensor(v) else v for k, v in inputs.items()}
-                        t_out = teacher_model(**t_inputs)
-                        t_logits = getattr(t_out, "logits", None)
-                    if moved:
-                        teacher_model = teacher_model.to(t_device)
-                    if was_training:
-                        teacher_model.train()
-                    return t_logits
-
-                teacher_logits = _teacher_logits(prev_teacher)
-                if teacher_logits is None:
-                    return (base_loss, outputs) if return_outputs else base_loss
-
-                teacher_logits = teacher_logits.to(logits_student.device).float()
-                student_logits = logits_student.float()
-
-                labels = inputs.get("labels") if isinstance(inputs, dict) else None
-                if labels is not None:
-                    valid_mask = labels != -100
-                    if valid_mask.any():
-                        teacher_logits = teacher_logits[valid_mask]
-                        student_logits = student_logits[valid_mask]
-                    else:
-                        return (base_loss, outputs) if return_outputs else base_loss
-
-                kd_loss = F.kl_div(
-                    F.log_softmax(student_logits, dim=-1),
-                    F.softmax(teacher_logits, dim=-1),
-                    reduction="batchmean",
-                )
-                loss = base_loss + self.target_prev_ce_weight * kd_loss
-                return (loss, outputs) if return_outputs else loss
-
-            trainer.compute_loss = compute_loss_with_prev_teacher
-        trainer.train()
-        trained_model = trainer.model.cpu()
+        elif (
+            prev_teacher is not None
+            and self.target_prev_ce_enabled
+            and float(self.target_prev_ce_weight) != 0
+        ):
+            trained_model = self._train_target_with_prev_teacher(
+                trainer=trainer,
+                student_model=client_model,
+                teacher_model=deepcopy(prev_teacher),
+                device=self.train_device if device is None else device,
+            )
+        if trained_model is None:
+            trainer.train()
+            trained_model = trainer.model.cpu()
         if target_device is not None and target_device.type == "cuda":
             torch.cuda.empty_cache()
         return trained_model
@@ -899,6 +858,82 @@ class FederatedPermTrainer(FinetuneTrainer):
         if isinstance(batch, list):
             return [self._move_batch_to_device(v, device) for v in batch]
         return batch
+
+    def _train_target_with_prev_teacher(self, trainer, student_model, teacher_model, device):
+        """
+        使用“先更新 teacher，再更新 student”的交替方式训练目标客户端。
+        teacher 基于真实标签优化，随后固定 teacher，仅更新 student。
+        """
+        student_model = student_model.to(device)
+        teacher_model = teacher_model.to(device)
+        student_model.train()
+        teacher_model.train()
+
+        dataloader = trainer.get_train_dataloader()
+        args = trainer.args
+        grad_accum = max(1, getattr(args, "gradient_accumulation_steps", 1))
+        num_epochs = int(getattr(args, "num_train_epochs", 1))
+        max_grad_norm = getattr(args, "max_grad_norm", None)
+        teacher_weight = float(self.target_prev_ce_weight)
+
+        teacher_opt = AdamW(
+            teacher_model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=getattr(args, "weight_decay", 0.0),
+        )
+        student_opt = AdamW(
+            student_model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=getattr(args, "weight_decay", 0.0),
+        )
+
+        teacher_opt.zero_grad(set_to_none=True)
+        student_opt.zero_grad(set_to_none=True)
+
+        for _ in range(num_epochs):
+            step = -1
+            for step, batch in enumerate(dataloader):
+                batch = self._move_batch_to_device(batch, device)
+
+                # Step 1: 更新 teacher（CE + 真实标签）
+                teacher_loss = teacher_weight * teacher_model(**batch).loss / grad_accum
+                teacher_loss.backward()
+                if (step + 1) % grad_accum == 0:
+                    if max_grad_norm is not None:
+                        clip_grad_norm_(teacher_model.parameters(), max_grad_norm)
+                    teacher_opt.step()
+                    teacher_opt.zero_grad(set_to_none=True)
+
+                # Step 2: 固定 teacher，更新 student
+                teacher_model.eval()
+                with torch.no_grad():
+                    teacher_const_loss = teacher_weight * teacher_model(**batch).loss
+                teacher_model.train()
+
+                student_loss = student_model(**batch).loss
+                # 加上常数项以保持 loss 形式一致（对梯度无影响）
+                student_loss = student_loss + teacher_const_loss.detach()
+                student_loss = student_loss / grad_accum
+                student_loss.backward()
+                if (step + 1) % grad_accum == 0:
+                    if max_grad_norm is not None:
+                        clip_grad_norm_(student_model.parameters(), max_grad_norm)
+                    student_opt.step()
+                    student_opt.zero_grad(set_to_none=True)
+
+            # flush 残余梯度（处理非整除 grad_accum 的情况）
+            if step >= 0 and (step + 1) % grad_accum != 0:
+                if max_grad_norm is not None:
+                    clip_grad_norm_(teacher_model.parameters(), max_grad_norm)
+                    clip_grad_norm_(student_model.parameters(), max_grad_norm)
+                teacher_opt.step()
+                student_opt.step()
+                teacher_opt.zero_grad(set_to_none=True)
+                student_opt.zero_grad(set_to_none=True)
+
+        student_model = student_model.cpu()
+        teacher_model = teacher_model.cpu()
+        return student_model
 
     def _save_round_outputs(self, round_idx: int):
         """Persist server and target-client checkpoints for a given round."""
