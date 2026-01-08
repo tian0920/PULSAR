@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvgM}"
+FL_METHOD="${FL_METHOD:-FedAdam }"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fl-method)

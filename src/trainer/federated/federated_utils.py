@@ -180,6 +180,16 @@ def FedAvg(client_state_dicts, global_model_state_dict=None, client_weights=None
 
 
 def FedProx(client_state_dicts, global_model_state_dict=None, mu=0.01, client_weights=None):
+    if global_model_state_dict is not None and client_state_dicts:
+        ref_tensor = None
+        for value in client_state_dicts[0].values():
+            if isinstance(value, torch.Tensor):
+                ref_tensor = value
+                break
+        if ref_tensor is not None:
+            for key, value in global_model_state_dict.items():
+                if isinstance(value, torch.Tensor) and value.device != ref_tensor.device:
+                    global_model_state_dict[key] = value.to(ref_tensor.device)
 
     return FedAvg(client_state_dicts, global_model_state_dict, client_weights)
 
@@ -240,6 +250,14 @@ def FedAdagrad(client_state_dicts: List[Dict], global_model_state_dict: Dict,
         server_velocity = {}
         for key in global_model_state_dict.keys():
             server_velocity[key] = torch.ones_like(global_model_state_dict[key]) * tau**2
+    else:
+        for key in global_model_state_dict.keys():
+            if key not in server_velocity:
+                server_velocity[key] = torch.ones_like(global_model_state_dict[key]) * tau**2
+                continue
+            if isinstance(server_velocity[key], torch.Tensor) and isinstance(global_model_state_dict[key], torch.Tensor):
+                if server_velocity[key].device != global_model_state_dict[key].device:
+                    server_velocity[key] = server_velocity[key].to(global_model_state_dict[key].device)
 
     for key in global_model_state_dict.keys():
         delta = torch.zeros_like(global_model_state_dict[key])
@@ -272,11 +290,27 @@ def FedYogi(client_state_dicts: List[Dict], global_model_state_dict: Dict,
         proxy_dict = {}
         for key in global_model_state_dict.keys():
             proxy_dict[key] = torch.zeros_like(global_model_state_dict[key])
+    else:
+        for key in global_model_state_dict.keys():
+            if key not in proxy_dict:
+                proxy_dict[key] = torch.zeros_like(global_model_state_dict[key])
+                continue
+            if isinstance(proxy_dict[key], torch.Tensor) and isinstance(global_model_state_dict[key], torch.Tensor):
+                if proxy_dict[key].device != global_model_state_dict[key].device:
+                    proxy_dict[key] = proxy_dict[key].to(global_model_state_dict[key].device)
     
     if opt_proxy_dict is None:
         opt_proxy_dict = {}
         for key in global_model_state_dict.keys():
             opt_proxy_dict[key] = torch.ones_like(global_model_state_dict[key]) * tau**2
+    else:
+        for key in global_model_state_dict.keys():
+            if key not in opt_proxy_dict:
+                opt_proxy_dict[key] = torch.ones_like(global_model_state_dict[key]) * tau**2
+                continue
+            if isinstance(opt_proxy_dict[key], torch.Tensor) and isinstance(global_model_state_dict[key], torch.Tensor):
+                if opt_proxy_dict[key].device != global_model_state_dict[key].device:
+                    opt_proxy_dict[key] = opt_proxy_dict[key].to(global_model_state_dict[key].device)
 
     for key in global_model_state_dict.keys():
         delta = torch.zeros_like(global_model_state_dict[key])
@@ -291,10 +325,10 @@ def FedYogi(client_state_dicts: List[Dict], global_model_state_dict: Dict,
     return global_model_state_dict, proxy_dict, opt_proxy_dict
 
 
-def FedAdam(client_state_dicts: List[Dict], global_model_state_dict: Dict, 
-           proxy_dict: Dict = None, opt_proxy_dict: Dict = None, round_idx: int = 0, 
-           beta1: float = 0.9, beta2: float = 0.99, epsilon: float = 1e-3, tau: float = 1e-3, 
-           client_weights: List[float] = None) -> Tuple[Dict, Dict, Dict]:
+def FedAdam(client_state_dicts: List[Dict], global_model_state_dict: Dict,
+            proxy_dict: Dict = None, opt_proxy_dict: Dict = None, round_idx: int = 0, 
+            beta1: float = 0.9, beta2: float = 0.99, epsilon: float = 1e-3, tau: float = 1e-3,
+            client_weights: List[float] = None) -> Tuple[Dict, Dict, Dict]:
    
     num_clients = len(client_state_dicts)
     
@@ -310,11 +344,27 @@ def FedAdam(client_state_dicts: List[Dict], global_model_state_dict: Dict,
         proxy_dict = {}
         for key in global_model_state_dict.keys():
             proxy_dict[key] = torch.zeros_like(global_model_state_dict[key])
+    else:
+        for key in global_model_state_dict.keys():
+            if key not in proxy_dict:
+                proxy_dict[key] = torch.zeros_like(global_model_state_dict[key])
+                continue
+            if isinstance(proxy_dict[key], torch.Tensor) and isinstance(global_model_state_dict[key], torch.Tensor):
+                if proxy_dict[key].device != global_model_state_dict[key].device:
+                    proxy_dict[key] = proxy_dict[key].to(global_model_state_dict[key].device)
     
     if opt_proxy_dict is None:
         opt_proxy_dict = {}
         for key in global_model_state_dict.keys():
             opt_proxy_dict[key] = torch.ones_like(global_model_state_dict[key]) * tau**2
+    else:
+        for key in global_model_state_dict.keys():
+            if key not in opt_proxy_dict:
+                opt_proxy_dict[key] = torch.ones_like(global_model_state_dict[key]) * tau**2
+                continue
+            if isinstance(opt_proxy_dict[key], torch.Tensor) and isinstance(global_model_state_dict[key], torch.Tensor):
+                if opt_proxy_dict[key].device != global_model_state_dict[key].device:
+                    opt_proxy_dict[key] = opt_proxy_dict[key].to(global_model_state_dict[key].device)
     
     for key in global_model_state_dict.keys():
 
