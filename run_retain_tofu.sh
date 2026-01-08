@@ -7,8 +7,24 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvg}"
-IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
+FL_METHOD="${FL_METHOD:-FedAvgM}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fl-method)
+      FL_METHOD="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      echo "Unknown argument: $1"
+      exit 1
+      ;;
+  esac
+done
+# 支持多个 FL 方法（逗号分隔），默认只有一个
 IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 LAUNCHER=(python)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -35,7 +51,7 @@ fi
 
 REVOKER_CLIENT_IDX=0
 
-GLOBAL_ROUNDS=10
+GLOBAL_ROUNDS=20
 SAVE_INTERVAL=0              # 0 表示每轮保存；1 表示间隔一轮保存（1,3,5...），以此类推
 
 SEED=42
@@ -171,6 +187,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.method_args.train_on="retain" \
           trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \
           trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
+          trainer.method_args.aggregation_strategy="${CURRENT_FL_METHOD}" \
           trainer.method_args.global_rounds="${GLOBAL_ROUNDS}" \
           trainer.method_args.save_client_splits_for_eval="${SAVE_SPLITS_FOR_EVAL}" \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
