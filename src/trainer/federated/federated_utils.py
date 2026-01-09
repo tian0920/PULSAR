@@ -202,6 +202,14 @@ def FedAvgM(client_state_dicts: List[Dict], global_model_state_dict: Dict,
         proxy_dict = {}
         for key in global_model_state_dict.keys():
             proxy_dict[key] = torch.zeros_like(global_model_state_dict[key])
+    else:
+        for key in global_model_state_dict.keys():
+            if key not in proxy_dict:
+                proxy_dict[key] = torch.zeros_like(global_model_state_dict[key])
+                continue
+            if isinstance(proxy_dict[key], torch.Tensor) and isinstance(global_model_state_dict[key], torch.Tensor):
+                if proxy_dict[key].device != global_model_state_dict[key].device:
+                    proxy_dict[key] = proxy_dict[key].to(global_model_state_dict[key].device)
         
     for key in global_model_state_dict.keys():
         delta = torch.zeros_like(global_model_state_dict[key])
