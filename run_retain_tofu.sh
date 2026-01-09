@@ -52,6 +52,7 @@ fi
 REVOKER_CLIENT_IDX=0
 
 GLOBAL_ROUNDS=20
+GLOBAL_ROUNDS=20
 SAVE_INTERVAL=0              # 0 表示每轮保存；1 表示间隔一轮保存（1,3,5...），以此类推
 
 SEED=42
@@ -187,6 +188,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.method_args.train_on="retain" \
           trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \
           trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
+          trainer.method_args.aggregation_strategy="${CURRENT_FL_METHOD}" \
           trainer.method_args.aggregation_strategy="${CURRENT_FL_METHOD}" \
           trainer.method_args.global_rounds="${GLOBAL_ROUNDS}" \
           trainer.method_args.save_client_splits_for_eval="${SAVE_SPLITS_FOR_EVAL}" \
