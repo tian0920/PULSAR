@@ -35,7 +35,7 @@ echo "Single-GPU mode; using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 ENABLE_PRE_EVAL="${ENABLE_PRE_EVAL:-false}"
 
 ########################################
-MODELS=("Qwen2.5-1.5B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1B-Instruct-lora
+MODELS=("Llama-3.2-1B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1B-Instruct-lora
 
 FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
@@ -52,7 +52,7 @@ fi
 
 REVOKER_CLIENT_IDX=0
 
-GLOBAL_ROUNDS=2
+GLOBAL_ROUNDS=20
 SAVE_INTERVAL=0              # 0 表示每轮保存；1 表示间隔一轮保存（1,3,5...），以此类推
 
 SEED=42

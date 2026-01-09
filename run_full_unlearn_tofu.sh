@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvgM}"
+FL_METHOD="${FL_METHOD:-FedAvg}"
 DEFAULT_UNLEARN_CLS=("NPO")  # "NPO" "SimNPO" "GradAscent" "GradDiff"
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
@@ -51,7 +51,7 @@ IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 ########################################
 # 公共配置
 ########################################
-MODELS=("Qwen2.5-1.5B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1B-Instruct-lora
+MODELS=("Llama-3.2-1B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1B-Instruct-lora
 
 FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
@@ -72,14 +72,14 @@ CLIENT_C_IDX=2
 ENABLE_PERMUTATION=false    # 神经元转置
 
 # full 阶段
-FULL_GLOBAL_ROUNDS=2
+FULL_GLOBAL_ROUNDS=10
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
 
 # 遗忘+恢复阶段（沿用 run_fedperm_only 的编排）
-UNLEARN_GLOBAL_ROUNDS=2
+UNLEARN_GLOBAL_ROUNDS=10
 NORMAL_BEFORE_FORGET=0
-FORGET_ROUNDS=1
-RECOVERY_START=1
+FORGET_ROUNDS=5
+RECOVERY_START=5
 UNLEARN_SAVE_INTERVAL=0  # unlearn 阶段：同上
 
 UNLEARN_EPOCHS=1   # 过滤器训练轮次
