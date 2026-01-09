@@ -8,6 +8,10 @@ from trainer.base import FinetuneTrainer
 from torch.utils.data import Dataset
 from trainer.federated.federated_utils import (
     FedAvg,
+    FedAvgM,
+    FedAdagrad,
+    FedYogi,
+    FedAdam,
     apply_inverse_permutation,
     apply_adversarial_filter,
     apply_permutation,
@@ -129,6 +133,22 @@ class FederatedPermTrainer(FinetuneTrainer):
         self.train_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         self.server_device = self.train_device
         self.filter_device = self.train_device
+        self.fedadam_momentum = None
+        self.fedadam_velocity = None
+        self.fedyogi_momentum = None
+        self.fedyogi_velocity = None
+        self.fedavgm_momentum = None
+        self.fedadagrad_velocity = None
+        self.federated_args = {
+            "beta1": kwargs.get("beta1", 0.9),
+            "beta2": kwargs.get("beta2", 0.99),
+            "epsilon": kwargs.get(
+                "epsilon",
+                self.aggregation_lr if self.aggregation_lr is not None else 1e-3,
+            ),
+            "tau": kwargs.get("tau", 1e-3),
+            "momentum_factor": kwargs.get("momentum_factor", 0.9),
+        }
 
         if not self.federated_dataset:
             logger.warning("No federated dataset provided!")
@@ -140,6 +160,7 @@ class FederatedPermTrainer(FinetuneTrainer):
         logger.info(f"FedPerm initialized with {num_clients} clients")
         logger.info(f"Target client (B): {self.target_client_idx}, Revoker client (A): {self.revoker_client_idx}")
         logger.info(f"Model type - PEFT: {self.is_peft}")
+        logger.info(f"Aggregation strategy: {self.aggregation_strategy}")
         logger.info(f"Revocation enabled: {self.enable_revocation}, permutation enabled: {self.enable_permutation}")
         logger.info(f"Forget rounds: {sorted(self.forget_rounds)}, recovery starts at: {self.recovery_round_start}")
         if self.prev_target_model_path:
@@ -1185,12 +1206,65 @@ class FederatedPermTrainer(FinetuneTrainer):
         else:
             client_weights = [w / weight_sum for w in client_weights]
 
-        # Aggregate full parameters (FedAvg-style) using client weights
-        aggregated_state = FedAvg(
-            aligned_client_states,
-            global_model_state_dict=global_state,
-            client_weights=client_weights,
-        )
+        if self.aggregation_strategy == "FedAvg":
+            aggregated_state = FedAvg(
+                aligned_client_states,
+                global_model_state_dict=global_state,
+                client_weights=client_weights,
+            )
+        elif self.aggregation_strategy == "FedAvgM":
+            aggregated_state, self.fedavgm_momentum = FedAvgM(
+                aligned_client_states,
+                global_model_state_dict=global_state,
+                proxy_dict=self.fedavgm_momentum,
+                round_idx=round_idx,
+                momentum_factor=self.federated_args["momentum_factor"],
+                tau=self.federated_args["tau"],
+                client_weights=client_weights,
+            )
+        elif self.aggregation_strategy == "FedAdagrad":
+            aggregated_state, self.fedadagrad_velocity = FedAdagrad(
+                aligned_client_states,
+                global_model_state_dict=global_state,
+                server_velocity=self.fedadagrad_velocity,
+                epsilon=self.federated_args["epsilon"],
+                tau=self.federated_args["tau"],
+                client_weights=client_weights,
+            )
+        elif self.aggregation_strategy == "FedYogi":
+            aggregated_state, self.fedyogi_momentum, self.fedyogi_velocity = FedYogi(
+                aligned_client_states,
+                global_model_state_dict=global_state,
+                proxy_dict=self.fedyogi_momentum,
+                opt_proxy_dict=self.fedyogi_velocity,
+                round_idx=round_idx,
+                beta1=self.federated_args["beta1"],
+                beta2=self.federated_args["beta2"],
+                epsilon=self.federated_args["epsilon"],
+                tau=self.federated_args["tau"],
+                client_weights=client_weights,
+            )
+        elif self.aggregation_strategy == "FedAdam":
+            aggregated_state, self.fedadam_momentum, self.fedadam_velocity = FedAdam(
+                aligned_client_states,
+                global_model_state_dict=global_state,
+                proxy_dict=self.fedadam_momentum,
+                opt_proxy_dict=self.fedadam_velocity,
+                round_idx=round_idx,
+                beta1=self.federated_args["beta1"],
+                beta2=self.federated_args["beta2"],
+                epsilon=self.federated_args["epsilon"],
+                tau=self.federated_args["tau"],
+                client_weights=client_weights,
+            )
+        elif self.aggregation_strategy == "FedProx":
+            aggregated_state = FedAvg(
+                aligned_client_states,
+                global_model_state_dict=global_state,
+                client_weights=client_weights,
+            )
+        else:
+            raise ValueError(f"Unsupported aggregation_strategy: {self.aggregation_strategy}")
 
         # Move aggregated state dict back to CPU if model is on CPU (to match model device)
         model_device = next(self.model.parameters()).device

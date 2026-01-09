@@ -8,7 +8,7 @@ source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
 FL_METHOD="${FL_METHOD:-FedAvg}"
-DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff" "NPO" "SimNPO")
+DEFAULT_UNLEARN_CLS=("NPO")  # "NPO" "SimNPO" "GradAscent" "GradDiff"
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -51,7 +51,7 @@ IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 ########################################
 # 公共配置
 ########################################
-MODELS=("Llama-3.2-1B-Instruct-lora")
+MODELS=("Llama-3.2-1B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1B-Instruct-lora
 
 FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
@@ -90,7 +90,7 @@ TARGET_ANCHOR_REG_ENABLED=false
 TARGET_ANCHOR_REG_LAMBDA=1
 
 TARGET_PREV_CE_ENABLED=true   # 目标客户端本地训练双CE开关
-TARGET_PREV_CE_WEIGHT=2     # θ_unlearn的微调项系数
+TARGET_PREV_CE_WEIGHT=1     # θ_unlearn的微调项系数
 RECOVERY_LR="${RECOVERY_LR:-5e-4}"  # 可选：恢复阶段单独学习率（为空则不覆盖）
 
 SEED=42
@@ -108,75 +108,12 @@ run_eval() {
   run_eval_common "$@"
 }
 
-maybe_run_eval() {
-  local ckpt_dir="$1"
-  local stage="$2"
-  local log_file="$3"
-  shift 3
-  local summary_paths=("$@")
-
-  if [ "${CURRENT_ROUND:-0}" -gt 0 ] && [ "${SAVE_INTERVAL:-0}" -gt 0 ]; then
-    local gap=$((SAVE_INTERVAL + 1))
-    if [ "${CURRENT_ROUND}" -ne "${LAST_ROUND}" ] && [ $(( (CURRENT_ROUND - 1) % gap )) -ne 0 ]; then
-      echo "Skip eval ${stage} at round ${CURRENT_ROUND} due to SAVE_INTERVAL=${SAVE_INTERVAL}"
-      return
-    fi
-  fi
-
-  for summary_file in "${summary_paths[@]}"; do
-    if [ -s "${summary_file}" ]; then
-      echo "Skip eval ${stage}, summary already exists: ${summary_file}"
-      return
-    fi
-  done
-
-  run_eval "${ckpt_dir}" "${stage}" 2>&1 | tee "${log_file}"
-}
-
 sync_client_splits() {
   sync_client_splits_full "$@"
 }
 
 eval_rounds() {
-  local base_dir="$1"
-  local prefix="$2"
-  local total_rounds="${3:-${UNLEARN_GLOBAL_ROUNDS}}"
-  LAST_ROUND=${total_rounds}
-  for ((r=1; r<=total_rounds; r++)); do
-    CURRENT_ROUND=${r}
-    local post="${base_dir}/round_${r}"
-    if [ -d "${post}" ]; then
-      local post_summary_paths=(
-        "${post}/eval/${prefix}_round${r}_post_agg/TOFU_SUMMARY.json"
-        "${base_dir}/eval_rounds/round_${r}/server_post_agg/TOFU_SUMMARY.json"
-      )
-      maybe_run_eval "${post}" "${prefix}_round${r}_post_agg" \
-        "${LOG_ROOT}/${prefix}_round${r}_post_agg.txt" \
-        "${post_summary_paths[@]}"
-    else
-      echo "⚠️ 缺少聚合后检查点：${post}"
-    fi
-    local pre_round=$((r-1))
-    if [ ${pre_round} -ge 1 ]; then
-      if [ "${ENABLE_PRE_EVAL}" != "true" ]; then
-        if [ -z "${PRE_EVAL_SKIP_LOGGED:-}" ]; then
-          echo "Skip all pre evals because ENABLE_PRE_EVAL=${ENABLE_PRE_EVAL}"
-          PRE_EVAL_SKIP_LOGGED=true
-        fi
-        continue
-      fi
-      local pre="${base_dir}/round_${pre_round}"
-      if [ -d "${pre}" ]; then
-        local pre_summary_paths=(
-          "${pre}/eval/${prefix}_round${r}_pre_agg/TOFU_SUMMARY.json"
-          "${base_dir}/eval_rounds/round_${r}/server_pre_agg/TOFU_SUMMARY.json"
-        )
-        maybe_run_eval "${pre}" "${prefix}_round${r}_pre_agg" \
-          "${LOG_ROOT}/${prefix}_round${r}_pre_agg.txt" \
-          "${pre_summary_paths[@]}"
-      fi
-    fi
-  done
+  eval_rounds_common "$@"
 }
 
 # 确认按 SAVE_INTERVAL 需要保留的 round_* 是否都存在且非空
@@ -248,18 +185,34 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
 
       PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS - 1))
       PRE_BASE_SRC="${FULL_DIR}/round_${PRE_BASE_ROUND}"
+      PREV_TARGET_PATH="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_target_client_${TARGET_CLIENT_IDX}"
+      FORCE_FULL_RERUN=false
+      FULL_DONE=false
 
       if training_complete "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}"; then
-        if ! check_rounds_exist "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}" "${FULL_SAVE_INTERVAL}"; then
-          echo "❌ full 已完成但缺少按 SAVE_INTERVAL 应该存在的轮次；请删除 ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS} 后重新跑 full 阶段" >&2
-          exit 1
+        FULL_DONE=true
+        if [ "${TARGET_PREV_CE_ENABLED}" = "true" ]; then
+          if [ ! -d "${PREV_TARGET_PATH}" ] || [ -z "$(ls -A "${PREV_TARGET_PATH}")" ]; then
+            echo "⚠️ 缺少 prev target checkpoint：${PREV_TARGET_PATH}，删除最后一轮以触发重跑 full 阶段"
+            rm -rf "${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}"
+            FORCE_FULL_RERUN=true
+            FULL_DONE=false
+          fi
         fi
-        if [ ! -d "${PRE_BASE_SRC}" ]; then
-          echo "❌ full 已完成但缺少中间轮检查点：${PRE_BASE_SRC}；请删除 ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS} 后重新跑 full 阶段（FULL_SAVE_INTERVAL=0 确保每轮保存）" >&2
-          exit 1
+        if [ "${FULL_DONE}" = true ]; then
+          if ! check_rounds_exist "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}" "${FULL_SAVE_INTERVAL}"; then
+            echo "❌ full 已完成但缺少按 SAVE_INTERVAL 应该存在的轮次；请删除 ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS} 后重新跑 full 阶段" >&2
+            exit 1
+          fi
+          if [ ! -d "${PRE_BASE_SRC}" ]; then
+            echo "❌ full 已完成但缺少中间轮检查点：${PRE_BASE_SRC}；请删除 ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS} 后重新跑 full 阶段（FULL_SAVE_INTERVAL=0 确保每轮保存）" >&2
+            exit 1
+          fi
+          echo "Skip full training, final round exists: ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}"
         fi
-        echo "Skip full training, final round exists: ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}"
-      else
+      fi
+
+      if [ "${FULL_DONE}" != true ]; then
         EXTRA_EVAL_ARGS=()
         SAVE_SPLITS_FOR_EVAL=true
         if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
@@ -286,20 +239,17 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           experiment=finetune/tofu/default \
           model="${MODEL_CFG}" \
           task_name="${FULL_TASK}" \
-          trainer=FederatedPermTrainer \
-          trainer.method_args.enable_revocation=false \
+          trainer=FederatedFinetune \
           trainer.method_args.global_rounds="${FULL_GLOBAL_ROUNDS}" \
           trainer.method_args.aggregation_strategy="${CURRENT_FL_METHOD}" \
           trainer.method_args.train_on="full" \
           trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \
           trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
+          trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
+          trainer.method_args.save_target_client_checkpoint=true \
           trainer.method_args.save_client_splits_for_eval="${SAVE_SPLITS_FOR_EVAL}" \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
           trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
-          trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
-          trainer.method_args.eval_client_c_idx="${CLIENT_C_IDX}" \
-          trainer.method_args.normal_rounds_before_forget="${FULL_GLOBAL_ROUNDS}" \
-          trainer.method_args.forget_round_count=0 \
           data/datasets@data.train=TOFU_QA_full \
           data.train.TOFU_QA_full.args.hf_args.name=full \
           trainer.args.output_dir="${FULL_DIR}" \
@@ -368,6 +318,10 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           if [ -n "${RECOVERY_LR}" ]; then
             RECOVERY_ARGS+=(trainer.method_args.recovery_lr="${RECOVERY_LR}")
           fi
+          TARGET_PREV_CE_ARGS=()
+          if [ "${TARGET_PREV_CE_ENABLED}" = "true" ]; then
+            TARGET_PREV_CE_ARGS+=(trainer.method_args.prev_target_model_path="${PREV_TARGET_PATH}")
+          fi
           FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
           FEDPERM_SKIP_SAVE_ROUNDS="${SKIP_ROUNDS}" \
           "${LAUNCHER[@]}" src/federated_train.py \
@@ -401,7 +355,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
             trainer.method_args.target_prev_ce_weight="${TARGET_PREV_CE_WEIGHT}" \
             "${RECOVERY_ARGS[@]}" \
             +trainer.method_args.filter_base_model_path="${FILTER_BASE_DIR}" \
-            trainer.method_args.prev_target_model_path="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_target_client_${TARGET_CLIENT_IDX}" \
+            "${TARGET_PREV_CE_ARGS[@]}" \
             +trainer.method_args.enable_permutation="${ENABLE_PERMUTATION}" \
             data/datasets@data.train=TOFU_QA_full \
             data.train.TOFU_QA_full.args.hf_args.name=full \
