@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAdam }"
+FL_METHOD="${FL_METHOD:-FedAvgM}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fl-method)
@@ -24,6 +24,7 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
 # 支持多个 FL 方法（逗号分隔），默认只有一个
 IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 LAUNCHER=(python)
@@ -34,7 +35,7 @@ echo "Single-GPU mode; using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 ENABLE_PRE_EVAL="${ENABLE_PRE_EVAL:-false}"
 
 ########################################
-MODELS=("Llama-3.2-1B-Instruct-lora")
+MODELS=("Qwen2.5-1.5B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1B-Instruct-lora
 
 FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
@@ -51,7 +52,7 @@ fi
 
 REVOKER_CLIENT_IDX=0
 
-GLOBAL_ROUNDS=20
+GLOBAL_ROUNDS=2
 SAVE_INTERVAL=0              # 0 表示每轮保存；1 表示间隔一轮保存（1,3,5...），以此类推
 
 SEED=42
@@ -69,44 +70,7 @@ run_eval() {
 }
 
 eval_rounds() {
-  local base_dir="$1"
-  local prefix="$2"
-  LAST_ROUND=${GLOBAL_ROUNDS}
-  for ((r=1; r<=GLOBAL_ROUNDS; r++)); do
-    CURRENT_ROUND=${r}
-    local post="${base_dir}/round_${r}"
-    if [ -d "${post}" ]; then
-      local post_summary_paths=(
-        "${post}/eval/${prefix}_round${r}_post_agg/TOFU_SUMMARY.json"
-        "${base_dir}/eval_rounds/round_${r}/server_post_agg/TOFU_SUMMARY.json"
-      )
-      maybe_run_eval "${post}" "${prefix}_round${r}_post_agg" \
-        "${LOG_ROOT}/${prefix}_round${r}_post_agg.txt" \
-        "${post_summary_paths[@]}"
-    else
-      echo "⚠️ 缺少聚合后检查点：${post}"
-    fi
-    local pre_round=$((r-1))
-    if [ ${pre_round} -ge 1 ]; then
-      if [ "${ENABLE_PRE_EVAL}" != "true" ]; then
-        if [ -z "${PRE_EVAL_SKIP_LOGGED:-}" ]; then
-          echo "Skip all pre evals because ENABLE_PRE_EVAL=${ENABLE_PRE_EVAL}"
-          PRE_EVAL_SKIP_LOGGED=true
-        fi
-        continue
-      fi
-      local pre="${base_dir}/round_${pre_round}"
-      if [ -d "${pre}" ]; then
-        local pre_summary_paths=(
-          "${pre}/eval/${prefix}_round${r}_pre_agg/TOFU_SUMMARY.json"
-          "${base_dir}/eval_rounds/round_${r}/server_pre_agg/TOFU_SUMMARY.json"
-        )
-        maybe_run_eval "${pre}" "${prefix}_round${r}_pre_agg" \
-          "${LOG_ROOT}/${prefix}_round${r}_pre_agg.txt" \
-          "${pre_summary_paths[@]}"
-      fi
-    fi
-  done
+  eval_rounds_common "$@"
 }
 
 sync_client_splits() {

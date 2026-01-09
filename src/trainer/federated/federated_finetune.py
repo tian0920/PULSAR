@@ -26,6 +26,8 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         evaluator=None,
         template_args=None,
         num_clients=3,
+        target_client_idx: Optional[int] = None,
+        save_target_client_checkpoint: bool = False,
         aggregation_strategy="FedAvg",
         global_rounds=1,
         retain_ratio: float = 0.99,
@@ -57,6 +59,8 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         )
         
         self.num_clients = num_clients
+        self.target_client_idx = target_client_idx
+        self.save_target_client_checkpoint = save_target_client_checkpoint
         self.aggregation_strategy = aggregation_strategy
         self.global_rounds = global_rounds
         self.client_models = []
@@ -106,6 +110,8 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         
         logger.info(f"Initialized with {num_clients} clients, global rounds: {global_rounds}")
         logger.info(f"Model type - PEFT: {self.is_peft}")
+        if self.save_target_client_checkpoint:
+            logger.info(f"Save target client checkpoint: {self.target_client_idx}")
 
     def train(self, **kwargs):
 
@@ -201,9 +207,39 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 self.model = self.model.cpu()
                 self.save_model(save_path)
                 logger.info(f"Model saved at {save_path}")
+                self._maybe_save_target_client(round_idx)
         
         self.save_state()
         return None
+
+    def _maybe_save_target_client(self, round_idx: int):
+        """Optionally persist the target client's post-train checkpoint."""
+        if not self.save_target_client_checkpoint:
+            return
+        if self.target_client_idx is None or self.target_client_idx < 0:
+            logger.warning("save_target_client_checkpoint enabled but target_client_idx is invalid; skip.")
+            return
+        if self.target_client_idx >= len(self.client_models):
+            logger.warning(
+                f"target_client_idx {self.target_client_idx} out of range for {len(self.client_models)} clients; skip."
+            )
+            return
+        target_client_model = self.client_models[self.target_client_idx]
+        if target_client_model is None:
+            logger.warning(f"Target client {self.target_client_idx} model missing; skip.")
+            return
+        target_dir = f"{self.args.output_dir}/round_{round_idx + 1}_target_client_{self.target_client_idx}"
+        os.makedirs(target_dir, exist_ok=True)
+        if self.is_peft:
+            logger.info(
+                f"Saving target client {self.target_client_idx} PEFT model to {target_dir} (model only)"
+            )
+            target_client_model = target_client_model.cpu()
+            target_client_model.save_pretrained(target_dir, safe_serialization=False)
+        else:
+            target_client_model = target_client_model.cpu()
+            torch.save(target_client_model.state_dict(), os.path.join(target_dir, "pytorch_model.bin"))
+        logger.info(f"Target client {self.target_client_idx} model saved at {target_dir}")
 
     def train_client_model(self, client_model, client_dataset, device=None):
         # Move client model to GPU if available (Trainer will handle device placement, but we ensure it's on GPU)

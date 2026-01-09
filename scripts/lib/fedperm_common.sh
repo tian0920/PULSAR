@@ -54,6 +54,52 @@ maybe_run_eval() {
   run_eval "${ckpt_dir}" "${stage}" 2>&1 | tee "${log_file}"
 }
 
+# Shared round-based eval loop (same logic across retain/full/unlearn stages).
+eval_rounds_common() {
+  local base_dir="$1"
+  local prefix="$2"
+  local total_rounds="${3:-${GLOBAL_ROUNDS:-0}}"
+  if [ "${total_rounds}" -le 0 ]; then
+    return
+  fi
+  LAST_ROUND=${total_rounds}
+  for ((r=1; r<=total_rounds; r++)); do
+    CURRENT_ROUND=${r}
+    local post="${base_dir}/round_${r}"
+    if [ -d "${post}" ]; then
+      local post_summary_paths=(
+        "${post}/eval/${prefix}_round${r}_post_agg/TOFU_SUMMARY.json"
+        "${base_dir}/eval_rounds/round_${r}/server_post_agg/TOFU_SUMMARY.json"
+      )
+      maybe_run_eval "${post}" "${prefix}_round${r}_post_agg" \
+        "${LOG_ROOT}/${prefix}_round${r}_post_agg.txt" \
+        "${post_summary_paths[@]}"
+    else
+      echo "⚠️ 缺少聚合后检查点：${post}"
+    fi
+    local pre_round=$((r-1))
+    if [ ${pre_round} -ge 1 ]; then
+      if [ "${ENABLE_PRE_EVAL}" != "true" ]; then
+        if [ -z "${PRE_EVAL_SKIP_LOGGED:-}" ]; then
+          echo "Skip all pre evals because ENABLE_PRE_EVAL=${ENABLE_PRE_EVAL}"
+          PRE_EVAL_SKIP_LOGGED=true
+        fi
+        continue
+      fi
+      local pre="${base_dir}/round_${pre_round}"
+      if [ -d "${pre}" ]; then
+        local pre_summary_paths=(
+          "${pre}/eval/${prefix}_round${r}_pre_agg/TOFU_SUMMARY.json"
+          "${base_dir}/eval_rounds/round_${r}/server_pre_agg/TOFU_SUMMARY.json"
+        )
+        maybe_run_eval "${pre}" "${prefix}_round${r}_pre_agg" \
+          "${LOG_ROOT}/${prefix}_round${r}_pre_agg.txt" \
+          "${pre_summary_paths[@]}"
+      fi
+    fi
+  done
+}
+
 # Check whether the final round directory exists and is non-empty.
 training_complete() {
   local dir="$1"
