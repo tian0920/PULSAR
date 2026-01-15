@@ -8,7 +8,7 @@ source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
 FL_METHOD="${FL_METHOD:-FedAvg}"
-DEFAULT_UNLEARN_CLS=("GradAscent" "GradDiff")  # "NPO" "SimNPO"
+DEFAULT_UNLEARN_CLS=("GradAscent")  # "NPO" "SimNPO"
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -83,7 +83,7 @@ RECOVERY_START=5
 UNLEARN_SAVE_INTERVAL=0  # unlearn 阶段：同上
 
 UNLEARN_EPOCHS=1   # 过滤器训练轮次
-FILTER_ALPHA=1     # θ_g^t-(θ_g^{t-1}-alpha*θ_unlearn)
+FILTER_ALPHA=1     # θ_g^t-alpha*(θ_g^{t-1}-θ_unlearn)
 
 # 遗忘阶段目标客户端B本地LOSS正则锚点/双CE开关
 TARGET_ANCHOR_REG_ENABLED=false
@@ -290,20 +290,17 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           experiment=finetune/tofu/default \
           model="${MODEL_CFG}" \
           task_name="${FULL_TASK}" \
-          trainer=FederatedPermTrainer \
-          trainer.method_args.enable_revocation=false \
+          trainer=FederatedFinetune \
           trainer.method_args.global_rounds="${FULL_GLOBAL_ROUNDS}" \
           trainer.method_args.aggregation_strategy="${CURRENT_FL_METHOD}" \
           trainer.method_args.train_on="full" \
           trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \
           trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
+          trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
+          trainer.method_args.save_target_client_checkpoint=true \
           trainer.method_args.save_client_splits_for_eval="${SAVE_SPLITS_FOR_EVAL}" \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
           trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
-          trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
-          trainer.method_args.eval_client_c_idx="${CLIENT_C_IDX}" \
-          trainer.method_args.normal_rounds_before_forget="${FULL_GLOBAL_ROUNDS}" \
-          trainer.method_args.forget_round_count=0 \
           data/datasets@data.train=TOFU_QA_full \
           data.train.TOFU_QA_full.args.hf_args.name=full \
           trainer.args.output_dir="${FULL_DIR}" \

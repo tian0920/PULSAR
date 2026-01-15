@@ -651,11 +651,11 @@ class FederatedPermTrainer(FinetuneTrainer):
         else:
             object.__setattr__(unlearn_args, "_n_gpu", 0)
 
-        # 使用当前全局模型的一个拷贝作为遗忘起点
-        unlearn_model = deepcopy(self.model)
+        # 使用当前全局模型的一个拷贝作为遗忘起点（随后会被遗忘训练更新）
+        unlearn_init_model = deepcopy(self.model)
         if self.filter_device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.set_device(self.filter_device)
-            unlearn_model = unlearn_model.to(self.filter_device)
+            unlearn_init_model = unlearn_init_model.to(self.filter_device)
 
         # 只用 forget 数据驱动过滤器：retain_loss 权重设为 0
         from trainer import TRAINER_REGISTRY
@@ -667,7 +667,7 @@ class FederatedPermTrainer(FinetuneTrainer):
             return
 
         trainer_kwargs = dict(
-            model=unlearn_model,
+            model=unlearn_init_model,
             train_dataset=forget_dataset,
             tokenizer=self.tokenizer,
             data_collator=self.data_collator,
@@ -688,9 +688,9 @@ class FederatedPermTrainer(FinetuneTrainer):
 
         # 3. 计算当前全局参数与遗忘后模型之间的差值 → 过滤器 F_A
         # Extract state dicts (can be done on GPU if models are on GPU)
-        # 首选显式提供的 filter 基线（full 阶段最后一轮 server pre）；否则退化为当前全局模型
+        # 优先仅在第一次遗忘轮使用显式 filter 基线（full 阶段最后一轮 server pre）
         base_state = None
-        if self.filter_base_model_path:
+        if self.filter_base_model_path and not getattr(self, "_filter_base_used", False):
             if not os.path.isdir(self.filter_base_model_path):
                 raise FileNotFoundError(f"filter_base_model_path does not exist: {self.filter_base_model_path}")
             if self.is_peft:
@@ -702,20 +702,21 @@ class FederatedPermTrainer(FinetuneTrainer):
                         f"pytorch_model.bin not found at filter_base_model_path={self.filter_base_model_path}"
                     )
                 base_state = torch.load(weight_path, map_location="cpu")
+            self._filter_base_used = True
 
         if base_state is None:
             if self.is_peft:
                 base_state = get_peft_model_state_dict(self.model)
             else:
                 base_state = self.model.state_dict()
-            logger.info("Fallback to current global model as filter base state")
+            logger.info("Using current global model as filter base state")
         else:
             logger.info(f"Loaded filter base state from {self.filter_base_model_path}")
 
         if self.is_peft:
-            unlearn_state = get_peft_model_state_dict(unlearn_trainer.model)
+            unlearn_state = get_peft_model_state_dict(unlearn_model)
         else:
-            unlearn_state = unlearn_trainer.model.state_dict()
+            unlearn_state = unlearn_model.state_dict()
 
         # Use GPU for filter computation if available (faster)
         use_gpu_for_filter = torch.cuda.is_available()
@@ -730,9 +731,9 @@ class FederatedPermTrainer(FinetuneTrainer):
         missing_keys = 0
         for key, param in base_state.items():
             if key in unlearn_state and isinstance(param, torch.Tensor):
-                # F_A[key] = Theta^(t-1)[key] - alpha * Theta_unlearn[key]
-                self.filter_F_A[key] = (
-                    param - self.filter_alpha * unlearn_state[key]
+                # F_A[key] = alpha * (Theta^(t-1)[key] - Theta_unlearn[key]) 
+                self.filter_F_A[key] = self.filter_alpha * (
+                    param - unlearn_state[key]
                 ).detach().clone()
             else:
                 self.filter_F_A[key] = None
@@ -741,7 +742,7 @@ class FederatedPermTrainer(FinetuneTrainer):
         if missing_keys > 0:
             logger.warning(f"{missing_keys} keys in base_state not found in unlearn_state or not Tensor.")
 
-        logger.info("Filter F_A constructed from (Theta_prev - alpha * Theta_unlearn).")
+        logger.info("Filter F_A constructed from alpha * (Theta_prev - Theta_unlearn).")
         self.revocation_status = True
         logger.info("RevocationStatus set to True")
 
