@@ -91,7 +91,6 @@ TARGET_ANCHOR_REG_LAMBDA=1
 
 TARGET_PREV_CE_ENABLED=true   # 目标客户端本地训练双CE开关
 TARGET_PREV_CE_WEIGHT=1     # θ_unlearn的微调项系数
-RECOVERY_LR="${RECOVERY_LR:-5e-4}"  # 可选：恢复阶段单独学习率（为空则不覆盖）
 
 SEED=42
 
@@ -314,10 +313,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           fi
 
           SKIP_ROUNDS=$(compute_skip_rounds "${UNLEARN_GLOBAL_ROUNDS}" "${UNLEARN_SAVE_INTERVAL}")
-          RECOVERY_ARGS=()
-          if [ -n "${RECOVERY_LR}" ]; then
-            RECOVERY_ARGS+=(trainer.method_args.recovery_lr="${RECOVERY_LR}")
-          fi
           TARGET_PREV_CE_ARGS=()
           if [ "${TARGET_PREV_CE_ENABLED}" = "true" ]; then
             TARGET_PREV_CE_ARGS+=(trainer.method_args.prev_target_model_path="${PREV_TARGET_PATH}")
@@ -353,7 +348,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
             trainer.method_args.target_anchor_reg_lambda="${TARGET_ANCHOR_REG_LAMBDA}" \
             trainer.method_args.target_prev_ce_enabled="${TARGET_PREV_CE_ENABLED}" \
             trainer.method_args.target_prev_ce_weight="${TARGET_PREV_CE_WEIGHT}" \
-            "${RECOVERY_ARGS[@]}" \
             +trainer.method_args.filter_base_model_path="${FILTER_BASE_DIR}" \
             "${TARGET_PREV_CE_ARGS[@]}" \
             +trainer.method_args.enable_permutation="${ENABLE_PERMUTATION}" \
