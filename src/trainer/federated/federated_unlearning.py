@@ -1,5 +1,6 @@
 import torch
 import logging
+import shutil
 from copy import deepcopy
 from typing import Dict, List, Any, Optional
 import os
@@ -63,6 +64,11 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         self.client_models = []
         self.client_data_sizes = [] 
         self.kwargs = kwargs
+        self.enable_pre_eval = os.environ.get("ENABLE_PRE_EVAL", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         
   
         self.is_peft = isinstance(self.model, PeftModel)
@@ -96,6 +102,9 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             # 目标客户端在保留训练阶段的 proximal 约束系数，约束其靠近遗忘后参数（theta_unlearn）
             'prox_to_unlearn_mu': kwargs.get('prox_to_unlearn_mu', 0.01),
         }
+        self.init_all_clients_from_unlearn = kwargs.get(
+            "init_all_clients_from_unlearn", False
+        )
         self.theta_unlearn_state = None  # 保存遗忘后参数，用于目标客户端的 prox 约束
         
         if not self.federated_dataset:
@@ -146,6 +155,8 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             target_dataset = self.federated_dataset[self.target_client_idx]
             unlearn_trainer = self.unlearn_client_model(unlearn_model, target_dataset)
             logger.info("Completed unlearning on target client")
+            if self.init_all_clients_from_unlearn:
+                self._apply_theta_unlearn_state_to_global()
             # 在目标客户端保留训练前保存“纯遗忘后”模型，便于单独评测遗忘效果
             pre_retain_target_path = f"{self.args.output_dir}/pre_retain_target_client_{self.target_client_idx}"
             os.makedirs(pre_retain_target_path, exist_ok=True)
@@ -172,6 +183,14 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             
     
             logger.info("Step 2: All clients training on retain data with updated global model")
+
+            # Server-side eval before broadcasting (聚合前评测)
+            if self.enable_pre_eval:
+                self._maybe_evaluate_model(
+                    model=self.model,
+                    round_idx=round_idx,
+                    stage="server_pre_agg",
+                )
             
          
             self.client_models = [deepcopy(self.model) for _ in range(self.num_clients)]
@@ -190,17 +209,48 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 client_model = self.client_models[client_idx]
                 client_dataset = self.federated_dataset[client_idx]
                 
-                retain_data = client_dataset.retain.retain
+                retain_data = self._resolve_retain_data(client_dataset.retain)
                 client_data_size = len(retain_data)
                 self.client_data_sizes.append(client_data_size)
                 
                 logger.info(f"Training client {client_idx} on retain data with {self.args.num_train_epochs} epochs")
+                if self.enable_pre_eval:
+                    stage_name = f"client{client_idx}_pre_train"
+                    if round_idx == 0:
+                        reused = self._reuse_server_pre_eval(round_idx, stage_name)
+                    else:
+                        reused = self._reuse_server_post_eval(round_idx, stage_name)
+                    if not reused:
+                        self._maybe_evaluate_model(
+                            model=client_model,
+                            round_idx=round_idx,
+                            stage=stage_name,
+                        )
                 self.train_client_model(client_model, client_dataset, client_idx)
                 
                 self.client_models[client_idx] = client_model.cpu()
 
+            for client_idx in range(self.num_clients):
+                trained_client_model = (
+                    self.client_models[client_idx]
+                    if client_idx < len(self.client_models)
+                    else None
+                )
+                if trained_client_model is None:
+                    continue
+                self._maybe_evaluate_model(
+                    model=trained_client_model,
+                    round_idx=round_idx,
+                    stage=f"client{client_idx}_post_train",
+                )
+
             logger.info("Step 3: Aggregating all client models")
             self.aggregate_models(round_idx)
+            self._maybe_evaluate_model(
+                model=self.model,
+                round_idx=round_idx,
+                stage="server_post_agg",
+            )
             logger.info(f"Completed global round {round_idx + 1}/{self.global_rounds}")
             
             strategy = self._normalize_save_strategy(getattr(self.args, "save_strategy", None))
@@ -214,6 +264,184 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         # 保存最终的全局模型与目标客户端模型，便于后续测评
         # 不再额外生成 final_* 目录，依赖 round_N 检查点
         return None
+
+    @staticmethod
+    def _resolve_retain_data(retain_dataset):
+        """Return underlying retain split when present; fallback to the dataset itself."""
+        if hasattr(retain_dataset, "retain") and getattr(retain_dataset, "retain") is not None:
+            return retain_dataset.retain
+        return retain_dataset
+
+    def _apply_theta_unlearn_state_to_global(self):
+        """Initialize global model from theta_unlearn_state when available."""
+        if self.theta_unlearn_state is None:
+            return
+        if self.is_peft:
+            set_peft_model_state_dict(self.model, self.theta_unlearn_state)
+        else:
+            self.model.load_state_dict(self.theta_unlearn_state, strict=False)
+        logger.info("Initialized global model from theta_unlearn_state")
+
+    @staticmethod
+    def _normalize_save_strategy(strategy):
+        """Accept SaveStrategy/IntervalStrategy/str; default to EPOCH when None."""
+        if isinstance(strategy, SaveStrategy):
+            return strategy
+        if isinstance(strategy, IntervalStrategy):
+            try:
+                return SaveStrategy(strategy.value)
+            except Exception:
+                return SaveStrategy.EPOCH
+        if isinstance(strategy, str):
+            try:
+                return SaveStrategy(strategy.lower())
+            except Exception:
+                return SaveStrategy.EPOCH
+        if strategy is None:
+            return SaveStrategy.EPOCH
+        return SaveStrategy.EPOCH
+
+    def _maybe_evaluate_model(self, model, round_idx: int, stage: str):
+        """
+        Run evaluator (if provided) and save SUMMARY.json for the given stage.
+        """
+        if self.evaluator is None:
+            return
+        if (stage.startswith("server_pre") or stage.endswith("_pre_train")) and not self.enable_pre_eval:
+            logger.info(
+                f"Skipping pre eval for stage {stage} due to ENABLE_PRE_EVAL={self.enable_pre_eval}"
+            )
+            return
+        eval_dir = os.path.join(
+            self.args.output_dir,
+            "eval_rounds",
+            f"round_{round_idx + 1}",
+            stage,
+        )
+        os.makedirs(eval_dir, exist_ok=True)
+
+        summary_file = os.path.join(eval_dir, "TOFU_SUMMARY.json")
+        summary_exists = os.path.isfile(summary_file) and os.path.getsize(summary_file) > 0
+
+        force_eval = os.environ.get("FORCE_FEDPERM_EVAL", "0") in ("1", "true", "True")
+        if summary_exists and not force_eval:
+            logger.info(
+                f"Skipping eval for stage {stage} at round {round_idx + 1}, existing summary: {summary_file}"
+            )
+            return
+
+        model_was_on_cpu = next(model.parameters()).device.type == "cpu"
+        if torch.cuda.is_available() and model_was_on_cpu:
+            device = torch.device("cuda")
+            model = model.to(device)
+            logger.info(f"Model moved to GPU device {device} for evaluation at stage {stage}")
+
+        overwrite = True
+        if hasattr(self.evaluator, "eval_cfg"):
+            overwrite = getattr(self.evaluator.eval_cfg, "overwrite", True)
+
+        try:
+            self.evaluator.evaluate(
+                model=model,
+                tokenizer=self.tokenizer,
+                template_args=self.template_args,
+                output_dir=eval_dir,
+                overwrite=overwrite,
+            )
+        except Exception as exc:
+            logger.warning(f"Evaluation failed at {stage} (round {round_idx}): {exc}")
+        finally:
+            if torch.cuda.is_available() and model_was_on_cpu:
+                model = model.cpu()
+                torch.cuda.empty_cache()
+
+    def _reuse_server_post_eval(self, round_idx: int, target_stage: str) -> bool:
+        """
+        Reuse previous round server_post_agg eval as current pre_train eval.
+        """
+        if self.evaluator is None or round_idx == 0:
+            return False
+        prev_dir = os.path.join(
+            self.args.output_dir,
+            "eval_rounds",
+            f"round_{round_idx}",
+            "server_post_agg",
+        )
+        src_summary = os.path.join(prev_dir, "TOFU_SUMMARY.json")
+        if not os.path.isfile(src_summary):
+            return False
+
+        dest_dir = os.path.join(
+            self.args.output_dir,
+            "eval_rounds",
+            f"round_{round_idx + 1}",
+            target_stage,
+        )
+        os.makedirs(dest_dir, exist_ok=True)
+
+        copied = False
+        for fname in os.listdir(prev_dir):
+            src = os.path.join(prev_dir, fname)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(dest_dir, fname))
+                copied = True
+        if copied:
+            logger.info(
+                f"Reused server_post_agg eval (round {round_idx}) for stage {target_stage}"
+            )
+        return copied
+
+    def _reuse_server_pre_eval(self, round_idx: int, target_stage: str) -> bool:
+        """
+        Reuse current round server_pre_agg eval as client pre_train eval (first round).
+        """
+        if self.evaluator is None:
+            return False
+        src_dir = os.path.join(
+            self.args.output_dir,
+            "eval_rounds",
+            f"round_{round_idx + 1}",
+            "server_pre_agg",
+        )
+        src_summary = os.path.join(src_dir, "TOFU_SUMMARY.json")
+        if not os.path.isfile(src_summary):
+            return False
+
+        dest_dir = os.path.join(
+            self.args.output_dir,
+            "eval_rounds",
+            f"round_{round_idx + 1}",
+            target_stage,
+        )
+        os.makedirs(dest_dir, exist_ok=True)
+
+        copied = False
+        for fname in os.listdir(src_dir):
+            src = os.path.join(src_dir, fname)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(dest_dir, fname))
+                copied = True
+        if copied:
+            logger.info(
+                f"Reused server_pre_agg eval (round {round_idx + 1}) for stage {target_stage}"
+            )
+        return copied
+
+    @staticmethod
+    def _filter_unlearn_trainer_kwargs(kwargs):
+        """Drop unsupported args before constructing HF Trainer subclasses."""
+        if not kwargs:
+            return {}
+        filtered = dict(kwargs)
+        filtered.pop("retain_split_name", None)
+        filtered.pop("forget_split_name", None)
+        filtered.pop("save_client_splits_for_eval", None)
+        filtered.pop("retain_indices_path", None)
+        filtered.pop("forget_indices_path", None)
+        filtered.pop("assign_forget_to_revoker_only", None)
+        filtered.pop("revoker_client_idx", None)
+        filtered.pop("init_all_clients_from_unlearn", None)
+        return filtered
 
     def unlearn_client_model(self, client_model, client_dataset):
         from trainer import TRAINER_REGISTRY
@@ -233,23 +461,10 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             retain_dataset, "retain", None
         ) is not None:
             retain_dataset = retain_dataset.retain
-
-        # 记录当前全局模型状态，作为构造 filter_F_A 的基线
-        # Extract state dict without moving to CPU first (can be done on GPU if model is on GPU)
-        if self.is_peft:
-            base_state = get_peft_model_state_dict(self.model)
-        else:
-            base_state = self.model.state_dict()
-        
-        # Use GPU for filter computation if available (faster)
-        use_gpu_for_filter = torch.cuda.is_available()
-        filter_device = torch.device("cuda") if use_gpu_for_filter else torch.device("cpu")
-        if use_gpu_for_filter:
-            base_state = {k: v.to(filter_device) if isinstance(v, torch.Tensor) else v 
-                         for k, v in base_state.items()}
+        retain_data = self._resolve_retain_data(retain_dataset)
 
         logger.info(f"forget_data length: {len(forget_dataset)}")
-        logger.info(f"retain_data length: {len(retain_dataset.retain)}")
+        logger.info(f"retain_data length: {len(retain_data)}")
         logger.info(f"Unlearning_cls_name: {self.unlearn_trainer_cls}")
         
         class CombinedDataset(Dataset):
@@ -263,12 +478,18 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
 
             def __getitem__(self, idx):
                 retain_idx = idx % self.retain_length
+                forget_item = self.forget_data[idx]
+                retain_item = self.retain_data[retain_idx]
+                if not (isinstance(forget_item, dict) and "forget" in forget_item):
+                    forget_item = {"forget": forget_item}
+                if not (isinstance(retain_item, dict) and "retain" in retain_item):
+                    retain_item = {"retain": retain_item}
                 return {
-                    "forget": self.forget_data[idx],
-                    "retain": self.retain_data[retain_idx]
+                    "forget": forget_item,
+                    "retain": retain_item,
                 }
         
-        combined_dataset = CombinedDataset(forget_dataset, retain_dataset)
+        combined_dataset = CombinedDataset(forget_dataset, retain_data)
 
         # Ensure model is in training mode and parameters are trainable.
         # Some PEFT checkpoints arrive with all params frozen, which would make loss.detach() with no grad_fn.
@@ -296,6 +517,7 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         else:
             logger.info(f"Using default {unlearn_args.num_train_epochs} epochs for unlearn stage")
 
+        trainer_kwargs = self._filter_unlearn_trainer_kwargs(self.kwargs)
         if self.aggregation_strategy == "FedProx":
             class FedProxUnlearnTrainer(trainer_cls):
                 def __init__(self, *args, global_model=None, mu=0.01, **kwargs):
@@ -336,7 +558,7 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 template_args=self.template_args,
                 global_model=self.model.cpu(),
                 mu=self.federated_args['mu'],
-                **self.kwargs
+                **trainer_kwargs
             )
         else:
             unlearn_trainer = trainer_cls(
@@ -347,7 +569,7 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 args=unlearn_args, 
                 evaluator=self.evaluator,
                 template_args=self.template_args,
-                **self.kwargs
+                **trainer_kwargs
             )
         
         # After Trainer initialization, ensure model is in training mode and parameters are trainable
@@ -363,37 +585,18 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
 
         unlearn_trainer.train()
 
-        # 记录遗忘后参数，用于后续目标客户端保留训练的 proximal 约束
-        # Extract state dict without moving to CPU first (can be done on GPU if model is on GPU)
+        # 记录遗忘后参数
         if self.is_peft:
             self.theta_unlearn_state = get_peft_model_state_dict(unlearn_trainer.model)
         else:
             self.theta_unlearn_state = unlearn_trainer.model.state_dict()
-        
-        # Move theta_unlearn_state to filter device if needed
-        if use_gpu_for_filter:
-            self.theta_unlearn_state = {k: v.to(filter_device) if isinstance(v, torch.Tensor) else v 
-                                       for k, v in self.theta_unlearn_state.items()}
-
-        # 构造 filter_F_A = base_state - theta_unlearn_state (on GPU if available)
-        self.filter_F_A = {}
-        missing_keys = 0
-        for name, tensor in base_state.items():
-            ref = self.theta_unlearn_state.get(name) if self.theta_unlearn_state else None
-            if ref is None:
-                self.filter_F_A[name] = None
-                missing_keys += 1
-                continue
-            self.filter_F_A[name] = (tensor - ref).detach().clone()
-        if missing_keys > 0:
-            logger.warning(f"{missing_keys} keys in base_state not found in theta_unlearn_state or not Tensor.")
         
         return unlearn_trainer
     
 
     def train_client_model(self, client_model, client_dataset, client_idx):
         retain_dataset = client_dataset.retain
-        retain_data = retain_dataset.retain
+        retain_data = self._resolve_retain_data(retain_dataset)
         
         # Move client model to GPU if available (Trainer will handle device placement, but we ensure it's on GPU)
         if torch.cuda.is_available():
@@ -440,48 +643,6 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 global_model=self.model.cpu(),
                 mu=self.federated_args['mu']
             )
-        elif (
-            client_idx == self.target_client_idx
-            and self.theta_unlearn_state is not None
-        ):
-            # 仅对目标客户端应用 prox 约束，保持靠近遗忘后参数 theta_unlearn_state
-            class ProxToUnlearnTrainer(FinetuneTrainer):
-                def __init__(self, *args, ref_state=None, mu=0.01, **kwargs):
-                    super().__init__(*args, **kwargs)
-                    self.ref_state = ref_state
-                    self.mu = mu
-
-                def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-                    return_values = super().compute_loss(model, inputs, return_outputs=return_outputs)
-                    if return_outputs:
-                        loss, outputs = return_values
-                    else:
-                        loss = return_values
-
-                    proximal_term = 0.0
-                    if self.ref_state is not None:
-                        for name, w in model.named_parameters():
-                            if not w.requires_grad:
-                                continue
-                            key = name.replace(".default", "")
-                            ref = self.ref_state.get(key)
-                            if ref is None:
-                                continue
-                            proximal_term += torch.norm(w - ref.to(w.device).detach()) ** 2
-                        loss = loss + (self.mu / 2) * proximal_term
-                    return (loss, outputs) if return_outputs else loss
-
-            trainer = ProxToUnlearnTrainer(
-                model=client_model,
-                train_dataset=retain_data,
-                tokenizer=self.tokenizer,
-                data_collator=self.data_collator,
-                args=self.args,
-                evaluator=self.evaluator,
-                template_args=self.template_args,
-                ref_state=self.theta_unlearn_state,
-                mu=self.federated_args["prox_to_unlearn_mu"],
-            )
         else:
             trainer = FinetuneTrainer(
                 model=client_model,
@@ -514,11 +675,6 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         use_gpu_for_agg = torch.cuda.is_available()
         agg_device = torch.device("cuda") if use_gpu_for_agg else torch.device("cpu")
         
-        # Move filter_F_A to aggregation device if it exists
-        if hasattr(self, "filter_F_A") and self.filter_F_A is not None and use_gpu_for_agg:
-            self.filter_F_A = {k: v.to(agg_device) if isinstance(v, torch.Tensor) else v 
-                              for k, v in self.filter_F_A.items()}
-        
         if self.is_peft:
             client_state_dicts = []
             for idx, model in enumerate(self.client_models):
@@ -528,20 +684,6 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 if use_gpu_for_agg:
                     peft_state_dict = {k: v.to(agg_device) if isinstance(v, torch.Tensor) else v 
                                       for k, v in peft_state_dict.items()}
-                # 对目标客户端的更新加回遗忘过滤器，避免遗忘方向被带入全局聚合
-                if (
-                    idx == self.target_client_idx
-                    and hasattr(self, "filter_F_A")
-                    and self.filter_F_A is not None
-                ):
-                    restored_state = {}
-                    for name, tensor in peft_state_dict.items():
-                        filt = self.filter_F_A.get(name) if self.filter_F_A else None
-                        if filt is None:
-                            restored_state[name] = tensor
-                        else:
-                            restored_state[name] = tensor + filt.to(tensor.device)
-                    peft_state_dict = restored_state
                 client_state_dicts.append(peft_state_dict)
                 logger.debug(f"Client {model} has PEFT state dict")
         else:
@@ -554,19 +696,6 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 if use_gpu_for_agg:
                     state = {k: v.to(agg_device) if isinstance(v, torch.Tensor) else v 
                             for k, v in state.items()}
-                if (
-                    idx == self.target_client_idx
-                    and hasattr(self, "filter_F_A")
-                    and self.filter_F_A is not None
-                ):
-                    restored_state = {}
-                    for name, tensor in state.items():
-                        filt = self.filter_F_A.get(name) if self.filter_F_A else None
-                        if filt is None:
-                            restored_state[name] = tensor
-                        else:
-                            restored_state[name] = tensor + filt.to(tensor.device)
-                    state = restored_state
                 client_state_dicts.append(state)
 
         logger.info(f"Aggregation_strategy:{self.aggregation_strategy}, device: {agg_device}")
