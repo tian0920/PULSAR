@@ -64,6 +64,7 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         self.client_models = []
         self.client_data_sizes = [] 
         self.kwargs = kwargs
+        self.revoker_client_idx = kwargs.get("revoker_client_idx", 0)
         self.enable_pre_eval = os.environ.get("ENABLE_PRE_EVAL", "false").lower() in (
             "1",
             "true",
@@ -194,6 +195,11 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             
          
             self.client_models = [deepcopy(self.model) for _ in range(self.num_clients)]
+            if self.init_all_clients_from_unlearn:
+                for idx, client_model in enumerate(self.client_models):
+                    self._apply_theta_unlearn_state_to_model(
+                        client_model, scope=f"client{idx}"
+                    )
             self.client_data_sizes = [] 
 
            
@@ -274,13 +280,20 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
 
     def _apply_theta_unlearn_state_to_global(self):
         """Initialize global model from theta_unlearn_state when available."""
+        self._apply_theta_unlearn_state_to_model(self.model, scope="global")
+
+    def _apply_theta_unlearn_state_to_model(self, model, scope: str = "model"):
+        """Initialize a model from theta_unlearn_state when available."""
         if self.theta_unlearn_state is None:
+            logger.warning(
+                f"theta_unlearn_state is missing; skip applying to {scope}"
+            )
             return
         if self.is_peft:
-            set_peft_model_state_dict(self.model, self.theta_unlearn_state)
+            set_peft_model_state_dict(model, self.theta_unlearn_state)
         else:
-            self.model.load_state_dict(self.theta_unlearn_state, strict=False)
-        logger.info("Initialized global model from theta_unlearn_state")
+            model.load_state_dict(self.theta_unlearn_state, strict=False)
+        logger.info(f"Initialized {scope} from theta_unlearn_state")
 
     @staticmethod
     def _normalize_save_strategy(strategy):
@@ -312,6 +325,64 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 f"Skipping pre eval for stage {stage} due to ENABLE_PRE_EVAL={self.enable_pre_eval}"
             )
             return
+        # Align with FederatedPermTrainer: dynamic eval indices by stage.
+        try:
+            import re
+
+            split_dir = os.environ.get(
+                "FEDPERM_SPLIT_DIR", os.path.join(self.args.output_dir, "client_splits")
+            )
+            forget_idx_path = os.path.join(
+                split_dir, f"client{self.revoker_client_idx}_forget_indices.json"
+            )
+            retain_idx_path = None
+            m = re.match(r"client(\d+)_", stage)
+            if stage.startswith("server"):
+                retain_idx_path = os.path.join(split_dir, "global_retain_indices.json")
+            elif m:
+                cidx = int(m.group(1))
+                retain_idx_path = os.path.join(split_dir, f"client{cidx}_retain_indices.json")
+
+            if hasattr(self.evaluator, "eval_cfg"):
+                if hasattr(self.evaluator.eval_cfg, "tofu"):
+                    eval_tofu = self.evaluator.eval_cfg.tofu
+                    if not os.path.exists(forget_idx_path):
+                        logger.error(
+                            f"Forget indices missing for stage {stage}: {forget_idx_path}. "
+                            "Abort eval to avoid falling back to full dataset."
+                        )
+                        return
+                    eval_tofu.forget_indices_path = forget_idx_path
+                    if retain_idx_path:
+                        if not os.path.exists(retain_idx_path):
+                            logger.error(
+                                f"Retain indices missing for stage {stage}: {retain_idx_path}. "
+                                "Abort eval to avoid falling back to full dataset."
+                            )
+                            return
+                        eval_tofu.retain_indices_path = retain_idx_path
+                    self._update_eval_dataset_indices(eval_tofu)
+
+                if hasattr(self.evaluator.eval_cfg, "muse"):
+                    eval_muse = self.evaluator.eval_cfg.muse
+                    if not os.path.exists(forget_idx_path):
+                        logger.error(
+                            f"MUSE forget indices missing for stage {stage}: {forget_idx_path}. "
+                            "Abort eval to avoid falling back to full dataset."
+                        )
+                        return
+                    eval_muse.forget_indices_path = forget_idx_path
+                    self._update_eval_dataset_indices(eval_muse)
+
+                # Clear cached datasets so index changes take effect.
+                if hasattr(self.evaluator, "metrics"):
+                    for metric in self.evaluator.metrics.values():
+                        if hasattr(metric, "data"):
+                            metric.data = None
+                        if hasattr(metric, "collators"):
+                            metric.collators = None
+        except Exception as exc:
+            logger.warning(f"Failed to set eval indices dynamically: {exc}")
         eval_dir = os.path.join(
             self.args.output_dir,
             "eval_rounds",
@@ -355,6 +426,37 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 model = model.cpu()
                 torch.cuda.empty_cache()
 
+    @staticmethod
+    def _update_eval_dataset_indices(eval_cfg):
+        """Propagate retain/forget indices into metric dataset configs."""
+        if not hasattr(eval_cfg, "metrics"):
+            return
+        metrics_cfg = eval_cfg.metrics
+
+        def _update_datasets(datasets_cfg):
+            if not datasets_cfg:
+                return
+            for ds_name, ds_cfg in datasets_cfg.items():
+                args = ds_cfg.get("args", None)
+                if not args or "indices_path" not in args:
+                    continue
+                access_key = str(ds_cfg.get("access_key", "")).lower()
+                name_hint = str(ds_name).lower()
+                retain_path = getattr(eval_cfg, "retain_indices_path", None)
+                forget_path = getattr(eval_cfg, "forget_indices_path", None)
+                if "forget" in access_key or "forget" in name_hint:
+                    if forget_path:
+                        args["indices_path"] = forget_path
+                elif "retain" in access_key or "retain" in name_hint:
+                    if retain_path:
+                        args["indices_path"] = retain_path
+
+        for _, metric_cfg in metrics_cfg.items():
+            _update_datasets(metric_cfg.get("datasets", None))
+            pre_compute_cfg = metric_cfg.get("pre_compute", None)
+            if pre_compute_cfg:
+                for _, pre_cfg in pre_compute_cfg.items():
+                    _update_datasets(pre_cfg.get("datasets", None))
     def _reuse_server_post_eval(self, round_idx: int, target_stage: str) -> bool:
         """
         Reuse previous round server_post_agg eval as current pre_train eval.

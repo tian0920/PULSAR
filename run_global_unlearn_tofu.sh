@@ -7,9 +7,9 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvg}" # FedAdagrad, FedAdam, FedAvg, 
-DEFAULT_UNLEARN_CLS=("GradAscent")  # "NPO" "SimNPO" "GradAscent" "GradDiff"
-MODELS=("Llama-3.2-1B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1B-Instruct-lora
+FL_METHOD="${FL_METHOD:-FedAdagrad,FedAdam,FedAvg,FedAvgM,FedYogi,FedProx}" # FedAdagrad, FedAdam, FedAvg, FedAvgM, FedYogi, FedProx
+DEFAULT_UNLEARN_CLS=("SimNPO" "GradAscent")  # "NPO" "SimNPO" "GradAscent" "GradDiff"
+MODELS=("Llama-3.2-1B-Instruct-lora" "Qwen2.5-1.5B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1B-Instruct-lora
 
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
@@ -67,13 +67,13 @@ TARGET_CLIENT_IDX=0
 REVOKER_CLIENT_IDX=0
 
 # full 阶段
-FULL_GLOBAL_ROUNDS=2
+FULL_GLOBAL_ROUNDS=10
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
 
 # global unlearn 阶段
 UNLEARN_GLOBAL_ROUNDS=1
 UNLEARN_SAVE_INTERVAL=0  # unlearn 阶段：同上
-UNLEARN_EPOCHS=1
+UNLEARN_Filter_EPOCHS="${UNLEARN_Filter_EPOCHS:-1}"
 
 SEED=42
 
@@ -235,7 +235,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       SAVE_INTERVAL=${UNLEARN_SAVE_INTERVAL}
       for UNLEARN_METHOD in "${UNLEARN_CLS[@]}"; do
         echo "------- UNLEARN_METHOD=${UNLEARN_METHOD} -------"
-        UNLEARN_TASK="global_unlearn_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}_${UNLEARN_METHOD}"
+        UNLEARN_TASK="global_unlearn_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}_${UNLEARN_METHOD}_${UNLEARN_Filter_EPOCHS}"
         UNLEARN_DIR="${OUT_ROOT}/${UNLEARN_TASK}"
         CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
         mkdir -p "${UNLEARN_DIR}"
@@ -261,7 +261,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
             task_name="${UNLEARN_TASK}" \
             trainer=FederatedUnlearningTrainer \
             trainer.method_args.global_rounds="${UNLEARN_GLOBAL_ROUNDS}" \
-            trainer.method_args.unlearn_epochs="${UNLEARN_EPOCHS}" \
+            trainer.method_args.unlearn_epochs="${UNLEARN_Filter_EPOCHS}" \
             trainer.method_args.unlearn_trainer_cls="${UNLEARN_METHOD}" \
             trainer.method_args.aggregation_strategy="${CURRENT_FL_METHOD}" \
             +trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \

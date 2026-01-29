@@ -6,6 +6,7 @@ import os
 import shutil
 from trainer.base import FinetuneTrainer
 from torch.utils.data import Dataset
+import torch.nn.functional as F
 from trainer.federated.federated_utils import (
     FedAvg,
     FedAvgM,
@@ -116,9 +117,17 @@ class FederatedPermTrainer(FinetuneTrainer):
         # 目标客户端遗忘阶段：loss = CE_current + lambda * CE_prev_post(B)
         self.target_prev_ce_enabled = kwargs.get("target_prev_ce_enabled", False)
         self.target_prev_ce_weight = float(kwargs.get("target_prev_ce_weight", 1.0))
+        self.target_prev_ce_distill_weight = float(
+            kwargs.get("target_prev_ce_distill_weight", 0.0)
+        )
+        self.target_prev_ce_distill_temperature = float(
+            kwargs.get("target_prev_ce_distill_temperature", 1.0)
+        )
         self.prev_target_model_path = kwargs.get("prev_target_model_path", None)
         self.prev_target_model_post = None
-        self.filter_base_model_path = kwargs.get("filter_base_model_path", None)
+        self.unlearn_base_full_rounds = kwargs.get("unlearn_base_full_rounds", None)
+        self.unlearn_base_offset = kwargs.get("unlearn_base_offset", None)
+        self.unlearn_base_full_dir = kwargs.get("unlearn_base_full_dir", None)
 
         self.revocation_status = False
         self.filter_F_A = None
@@ -165,8 +174,41 @@ class FederatedPermTrainer(FinetuneTrainer):
         logger.info(f"Forget rounds: {sorted(self.forget_rounds)}, recovery starts at: {self.recovery_round_start}")
         if self.prev_target_model_path:
             logger.info(f"Prev target model path: {self.prev_target_model_path}")
-        if self.filter_base_model_path:
-            logger.info(f"Filter base model path: {self.filter_base_model_path}")
+        if self.unlearn_base_full_rounds is not None and self.unlearn_base_offset is not None:
+            logger.info(
+                "Unlearn base schedule: full_rounds=%s, offset=%s, full_dir=%s",
+                self.unlearn_base_full_rounds,
+                self.unlearn_base_offset,
+                self.unlearn_base_full_dir,
+            )
+
+    def _resolve_unlearn_base_path(self, round_idx: int):
+        """
+        Map unlearn round index to a checkpoint path across full+unlearn rounds.
+        target_round = full_rounds + (t) - offset - 1, where t = round_idx + 1.
+        If target_round <= full_rounds: use full_dir/round_{target_round}
+        else use unlearn output_dir/round_{target_round - full_rounds}.
+        """
+        if (
+            self.unlearn_base_full_rounds is None
+            or self.unlearn_base_offset is None
+            or not self.unlearn_base_full_dir
+        ):
+            raise ValueError(
+                "unlearn base schedule is not configured; require "
+                "unlearn_base_full_rounds, unlearn_base_offset, unlearn_base_full_dir"
+            )
+        t = round_idx + 1
+        target_round = self.unlearn_base_full_rounds + t - self.unlearn_base_offset - 1
+        if target_round < 1:
+            raise ValueError(
+                f"unlearn base target_round < 1 (round_idx={round_idx}, "
+                f"full_rounds={self.unlearn_base_full_rounds}, offset={self.unlearn_base_offset})"
+            )
+        if target_round <= self.unlearn_base_full_rounds:
+            return os.path.join(self.unlearn_base_full_dir, f"round_{target_round}")
+        unlearn_round = target_round - self.unlearn_base_full_rounds
+        return os.path.join(self.args.output_dir, f"round_{unlearn_round}")
 
     def train(self, **kwargs):
         """Main training loop for FedPerm"""
@@ -273,19 +315,13 @@ class FederatedPermTrainer(FinetuneTrainer):
                 client_data_size = len(client_dataset) if client_dataset is not None else 0
                 self.client_data_sizes.append(client_data_size)
 
-                # 训练前评测（逐客户端），A/C 可复用 server 结果，B 在遗忘阶段需要重新评测
+                # 训练前评测（逐客户端）：不再复用 server 评测结果
                 if self.enable_pre_eval and self._should_eval_client(client_idx):
-                    stage_name = f"client{client_idx}_pre_train"
-                    if round_idx == 0:
-                        reused = self._reuse_server_pre_eval(round_idx, stage_name, client_idx)
-                    else:
-                        reused = self._reuse_server_post_eval(round_idx, stage_name, client_idx)
-                    if not reused:
-                        self._maybe_evaluate_model(
-                            model=client_model,
-                            round_idx=round_idx,
-                            stage=stage_name,
-                        )
+                    self._maybe_evaluate_model(
+                        model=client_model,
+                        round_idx=round_idx,
+                        stage=f"client{client_idx}_pre_train",
+                    )
             
             # Phase 2: Local Training (Parallel)
             logger.info("Phase 2: Local Training")
@@ -513,46 +549,6 @@ class FederatedPermTrainer(FinetuneTrainer):
                 model = model.cpu()
                 torch.cuda.empty_cache()
 
-    def _reuse_server_pre_eval(self, round_idx: int, target_stage: str, client_idx: int) -> bool:
-        """
-        Reuse current round server_pre_agg eval as client pre_train eval (first round).
-        若处于遗忘阶段且是目标客户端，则不复用。
-        """
-        if self.evaluator is None:
-            return False
-        # 遗忘阶段或已持有过滤器时，目标客户端需要重新评测
-        if client_idx == self.target_client_idx and (self.revocation_status or self.filter_F_A is not None):
-            return False
-        src_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx + 1}",
-            "server_pre_agg",
-        )
-        src_summary = os.path.join(src_dir, "TOFU_SUMMARY.json")
-        if not os.path.isfile(src_summary):
-            return False
-
-        dest_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx + 1}",
-            target_stage,
-        )
-        os.makedirs(dest_dir, exist_ok=True)
-
-        copied = False
-        for fname in os.listdir(src_dir):
-            src = os.path.join(src_dir, fname)
-            if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(dest_dir, fname))
-                copied = True
-        if copied:
-            logger.info(
-                f"Reused server_pre_agg eval (round {round_idx + 1}) for stage {target_stage}"
-            )
-        return copied
-
     def _reuse_server_post_eval(self, round_idx: int, target_stage: str, client_idx: int) -> bool:
         """
         Reuse previous round server_post_agg eval as current client pre_train eval
@@ -651,11 +647,40 @@ class FederatedPermTrainer(FinetuneTrainer):
         else:
             object.__setattr__(unlearn_args, "_n_gpu", 0)
 
-        # 使用当前全局模型的一个拷贝作为遗忘起点（随后会被遗忘训练更新）
+        # 遗忘起点：按 full+unlearn 连续轮次选择基线，否则用当前全局模型
         unlearn_init_model = deepcopy(self.model)
+        base_path = self._resolve_unlearn_base_path(round_idx)
+        if not os.path.isdir(base_path):
+            raise FileNotFoundError(
+                f"unlearn base path does not exist: {base_path}"
+            )
+        if self.is_peft:
+            base_state = self._load_peft_state(base_path, "unlearn init model")
+            set_peft_model_state_dict(unlearn_init_model, base_state)
+        else:
+            weight_path = os.path.join(base_path, "pytorch_model.bin")
+            if not os.path.isfile(weight_path):
+                raise FileNotFoundError(
+                    f"pytorch_model.bin not found at unlearn base path={base_path}"
+                )
+            base_state = torch.load(weight_path, map_location="cpu")
+            unlearn_init_model.load_state_dict(base_state)
+        logger.info(f"Initialized unlearn model from {base_path}")
         if self.filter_device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.set_device(self.filter_device)
             unlearn_init_model = unlearn_init_model.to(self.filter_device)
+
+        # 捕获遗忘起点参数（训练前）作为过滤器基线
+        # 注意：state_dict 返回的是参数引用，需 clone 固化基线
+        if self.is_peft:
+            base_state = get_peft_model_state_dict(unlearn_init_model)
+        else:
+            base_state = unlearn_init_model.state_dict()
+        base_state = {
+            k: (v.detach().clone().cpu() if isinstance(v, torch.Tensor) else v)
+            for k, v in base_state.items()
+        }
+
 
         # 只用 forget 数据驱动过滤器：retain_loss 权重设为 0
         from trainer import TRAINER_REGISTRY
@@ -688,30 +713,7 @@ class FederatedPermTrainer(FinetuneTrainer):
 
         # 3. 计算当前全局参数与遗忘后模型之间的差值 → 过滤器 F_A
         # Extract state dicts (can be done on GPU if models are on GPU)
-        # 优先仅在第一次遗忘轮使用显式 filter 基线（full 阶段最后一轮 server pre）
-        base_state = None
-        if self.filter_base_model_path and not getattr(self, "_filter_base_used", False):
-            if not os.path.isdir(self.filter_base_model_path):
-                raise FileNotFoundError(f"filter_base_model_path does not exist: {self.filter_base_model_path}")
-            if self.is_peft:
-                base_state = self._load_peft_state(self.filter_base_model_path, "filter base model")
-            else:
-                weight_path = os.path.join(self.filter_base_model_path, "pytorch_model.bin")
-                if not os.path.isfile(weight_path):
-                    raise FileNotFoundError(
-                        f"pytorch_model.bin not found at filter_base_model_path={self.filter_base_model_path}"
-                    )
-                base_state = torch.load(weight_path, map_location="cpu")
-            self._filter_base_used = True
-
-        if base_state is None:
-            if self.is_peft:
-                base_state = get_peft_model_state_dict(self.model)
-            else:
-                base_state = self.model.state_dict()
-            logger.info("Using current global model as filter base state")
-        else:
-            logger.info(f"Loaded filter base state from {self.filter_base_model_path}")
+        logger.info("Using unlearn init model as filter base state")
 
         if self.is_peft:
             unlearn_state = get_peft_model_state_dict(unlearn_model)
@@ -883,8 +885,8 @@ class FederatedPermTrainer(FinetuneTrainer):
 
     def _train_target_with_prev_teacher(self, trainer, student_model, teacher_model, device):
         """
-        使用“先更新 teacher，再更新 student”的交替方式训练目标客户端。
-        teacher 基于真实标签优化，随后固定 teacher，仅更新 student。
+        使用固定 teacher 约束 student 的本地训练。
+        teacher 不更新，仅提供蒸馏信号。
         """
         student_model = student_model.to(device)
         teacher_model = teacher_model.to(device)
@@ -896,20 +898,15 @@ class FederatedPermTrainer(FinetuneTrainer):
         grad_accum = max(1, getattr(args, "gradient_accumulation_steps", 1))
         num_epochs = int(getattr(args, "num_train_epochs", 1))
         max_grad_norm = getattr(args, "max_grad_norm", None)
-        teacher_weight = float(self.target_prev_ce_weight)
+        distill_weight = float(self.target_prev_ce_distill_weight)
+        distill_temp = float(self.target_prev_ce_distill_temperature)
 
-        teacher_opt = AdamW(
-            teacher_model.parameters(),
-            lr=args.learning_rate,
-            weight_decay=getattr(args, "weight_decay", 0.0),
-        )
         student_opt = AdamW(
             student_model.parameters(),
             lr=args.learning_rate,
             weight_decay=getattr(args, "weight_decay", 0.0),
         )
 
-        teacher_opt.zero_grad(set_to_none=True)
         student_opt.zero_grad(set_to_none=True)
 
         for _ in range(num_epochs):
@@ -917,24 +914,22 @@ class FederatedPermTrainer(FinetuneTrainer):
             for step, batch in enumerate(dataloader):
                 batch = self._move_batch_to_device(batch, device)
 
-                # Step 1: 更新 teacher（CE + 真实标签）
-                teacher_loss = teacher_weight * teacher_model(**batch).loss / grad_accum
-                teacher_loss.backward()
-                if (step + 1) % grad_accum == 0:
-                    if max_grad_norm is not None:
-                        clip_grad_norm_(teacher_model.parameters(), max_grad_norm)
-                    teacher_opt.step()
-                    teacher_opt.zero_grad(set_to_none=True)
-
-                # Step 2: 固定 teacher，更新 student
+                # 固定 teacher，更新 student
                 teacher_model.eval()
                 with torch.no_grad():
-                    teacher_const_loss = teacher_weight * teacher_model(**batch).loss
-                teacher_model.train()
+                    teacher_logits = teacher_model(**batch).logits
 
-                student_loss = student_model(**batch).loss
-                # 加上常数项以保持 loss 形式一致（对梯度无影响）
-                student_loss = student_loss + teacher_const_loss.detach()
+                student_outputs = student_model(**batch)
+                student_loss = student_outputs.loss
+                if distill_weight > 0:
+                    labels = batch.get("labels", None) if isinstance(batch, dict) else None
+                    distill_loss = self._compute_distill_kl(
+                        student_outputs.logits,
+                        teacher_logits,
+                        labels=labels,
+                        temperature=distill_temp,
+                    )
+                    student_loss = student_loss + distill_weight * distill_loss
                 student_loss = student_loss / grad_accum
                 student_loss.backward()
                 if (step + 1) % grad_accum == 0:
@@ -946,16 +941,28 @@ class FederatedPermTrainer(FinetuneTrainer):
             # flush 残余梯度（处理非整除 grad_accum 的情况）
             if step >= 0 and (step + 1) % grad_accum != 0:
                 if max_grad_norm is not None:
-                    clip_grad_norm_(teacher_model.parameters(), max_grad_norm)
                     clip_grad_norm_(student_model.parameters(), max_grad_norm)
-                teacher_opt.step()
                 student_opt.step()
-                teacher_opt.zero_grad(set_to_none=True)
                 student_opt.zero_grad(set_to_none=True)
 
         student_model = student_model.cpu()
         teacher_model = teacher_model.cpu()
         return student_model
+
+    @staticmethod
+    def _compute_distill_kl(student_logits, teacher_logits, labels=None, temperature: float = 1.0):
+        """KL(student || teacher) over token distributions with optional label mask."""
+        temp = max(float(temperature), 1e-6)
+        student_log_probs = F.log_softmax(student_logits / temp, dim=-1)
+        teacher_probs = F.softmax(teacher_logits / temp, dim=-1)
+        kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(-1)
+        if labels is not None:
+            mask = labels != -100
+            kl = kl * mask
+            denom = mask.sum().clamp_min(1)
+        else:
+            denom = kl.numel()
+        return (kl.sum() / denom) * (temp ** 2)
 
     def _save_round_outputs(self, round_idx: int):
         """Persist server and target-client checkpoints for a given round."""

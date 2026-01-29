@@ -31,6 +31,8 @@ method_args:
   # 可选：目标客户端 B 遗忘阶段附加上一轮 CE 监督
   target_prev_ce_enabled: false
   target_prev_ce_weight: 1.0
+  target_prev_ce_distill_weight: 0.0
+  target_prev_ce_distill_temperature: 1.0
   prev_target_model_path: null
 args:
   output_dir: "output/fedperm"

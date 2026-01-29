@@ -7,8 +7,8 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvg}"
-DEFAULT_UNLEARN_CLS=("NPO")  # "NPO" "SimNPO" "GradAscent" "GradDiff"
+FL_METHOD="${FL_METHOD:-FedAvg,FedAdam}" # FedAvg,FedAvgM,FedYogi,FedProx,FedAdam,FedAdagrad
+DEFAULT_UNLEARN_CLS=("GradAscent" "NPO" "SimNPO" "GradDiff")  # "NPO" "SimNPO" "GradAscent" "GradDiff"
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -74,12 +74,14 @@ ENABLE_PERMUTATION=false    # 神经元转置
 # full 阶段
 FULL_GLOBAL_ROUNDS=10
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
+PRE_BASE_OFFSET="${PRE_BASE_OFFSET:-1}"  # 取最后几轮前的基线（默认 1）
+PRE_BASE_OFFSETS="1,2,3,4"  # 逗号分隔，遍历多个 offset
 
 # 遗忘+恢复阶段（沿用 run_fedperm_only 的编排）
-UNLEARN_GLOBAL_ROUNDS=10
+UNLEARN_GLOBAL_ROUNDS=1
 NORMAL_BEFORE_FORGET=0
-FORGET_ROUNDS=5
-RECOVERY_START=5
+FORGET_ROUNDS=1
+RECOVERY_START=1
 UNLEARN_SAVE_INTERVAL=0  # unlearn 阶段：同上
 
 UNLEARN_EPOCHS=1   # 过滤器训练轮次
@@ -147,6 +149,7 @@ check_rounds_exist() {
 # 主流程
 ########################################
 
+IFS=',' read -ra PRE_BASE_OFFSET_LIST <<< "${PRE_BASE_OFFSETS}"
 for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
   echo "===== FL_METHOD=${CURRENT_FL_METHOD} ====="
 
@@ -159,6 +162,9 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       RETAIN_SPLIT="${RETAIN_SPLITS[$idx]}"
 
       echo ">>> SPLITS retain=${RETAIN_SPLIT} forget=${FORGET_SPLIT} holdout=${HOLDOUT_SPLIT}"
+
+      for PRE_BASE_OFFSET in "${PRE_BASE_OFFSET_LIST[@]}"; do
+        echo ">>> PRE_BASE_OFFSET=${PRE_BASE_OFFSET}"
 
       # 唯一划分目录，按 ASSIGN_FORGET_TO_REVOKER_ONLY 区分：fedperm / fedperm_only
       COMMON_SPLIT_DIR="${OUT_ROOT}/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
@@ -182,7 +188,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
       mkdir -p "${FULL_DIR}"
 
-      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS - 1))
+      PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS - PRE_BASE_OFFSET))
       PRE_BASE_SRC="${FULL_DIR}/round_${PRE_BASE_ROUND}"
       PREV_TARGET_PATH="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_target_client_${TARGET_CLIENT_IDX}"
       FORCE_FULL_RERUN=false
@@ -262,21 +268,10 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         fi
       fi
 
-      # 预留 filter 基线：取“最后一轮开始时”服务器下发的模型 = 上一轮聚合产物
-      FILTER_BASE_DIR=""
+      # 预留 unlearn 起点：确保 PRE_BASE_ROUND 的检查点存在
       if [ ${PRE_BASE_ROUND} -ge 1 ]; then
-        FILTER_BASE_DIR="${FULL_DIR}/round_${PRE_BASE_ROUND}_server_post"
-        if [ ! -d "${PRE_BASE_SRC}" ]; then
-          echo "❌ 缺少 filter 基线源目录：${PRE_BASE_SRC}；请先重新跑 full 阶段生成该轮检查点" >&2
-          exit 1
-        fi
-        if [ ! -d "${FILTER_BASE_DIR}" ] || [ -z "$(ls -A "${FILTER_BASE_DIR}")" ]; then
-          echo "Preserve filter base (start of last round) from ${PRE_BASE_SRC} to ${FILTER_BASE_DIR}"
-          mkdir -p "${FILTER_BASE_DIR}"
-          cp -r "${PRE_BASE_SRC}/." "${FILTER_BASE_DIR}/"
-        fi
-        if [ -z "$(ls -A "${FILTER_BASE_DIR}")" ]; then
-          echo "❌ filter 基线目录仍为空：${FILTER_BASE_DIR}" >&2
+        if [ ! -d "${PRE_BASE_SRC}" ] || [ -z "$(ls -A "${PRE_BASE_SRC}")" ]; then
+          echo "❌ 缺少 unlearn 起点目录：${PRE_BASE_SRC}；请先重新跑 full 阶段生成该轮检查点" >&2
           exit 1
         fi
       fi
@@ -296,7 +291,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       SAVE_INTERVAL=${UNLEARN_SAVE_INTERVAL}
       for UNLEARN_METHOD in "${UNLEARN_CLS[@]}"; do
         echo "------- UNLEARN_METHOD=${UNLEARN_METHOD} -------"
-        FEDPERM_TASK="unlearn_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}_${UNLEARN_METHOD}_filter${UNLEARN_EPOCHS}_CE${TARGET_PREV_CE_WEIGHT}_Alpha${FILTER_ALPHA}"
+        FEDPERM_TASK="unlearn_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}_${UNLEARN_METHOD}_filter${UNLEARN_EPOCHS}_CE${TARGET_PREV_CE_WEIGHT}_Alpha${FILTER_ALPHA}_Base${PRE_BASE_OFFSET}"
         FEDPERM_DIR="${OUT_ROOT}/${FEDPERM_TASK}"
         CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
         mkdir -p "${FEDPERM_DIR}"
@@ -348,7 +343,9 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
             trainer.method_args.target_anchor_reg_lambda="${TARGET_ANCHOR_REG_LAMBDA}" \
             trainer.method_args.target_prev_ce_enabled="${TARGET_PREV_CE_ENABLED}" \
             trainer.method_args.target_prev_ce_weight="${TARGET_PREV_CE_WEIGHT}" \
-            +trainer.method_args.filter_base_model_path="${FILTER_BASE_DIR}" \
+            +trainer.method_args.unlearn_base_full_rounds="${FULL_GLOBAL_ROUNDS}" \
+            +trainer.method_args.unlearn_base_offset="${PRE_BASE_OFFSET}" \
+            +trainer.method_args.unlearn_base_full_dir="${FULL_DIR}" \
             "${TARGET_PREV_CE_ARGS[@]}" \
             +trainer.method_args.enable_permutation="${ENABLE_PERMUTATION}" \
             data/datasets@data.train=TOFU_QA_full \
@@ -367,6 +364,8 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         SAVE_INTERVAL=${UNLEARN_SAVE_INTERVAL}
 
         eval_rounds "${FEDPERM_DIR}" "${FEDPERM_TASK}"
+
+      done
 
       done
 
