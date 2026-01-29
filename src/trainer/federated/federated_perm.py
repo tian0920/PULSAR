@@ -6,7 +6,6 @@ import os
 import shutil
 from trainer.base import FinetuneTrainer
 from torch.utils.data import Dataset
-import torch.nn.functional as F
 from trainer.federated.federated_utils import (
     FedAvg,
     FedAvgM,
@@ -117,12 +116,6 @@ class FederatedPermTrainer(FinetuneTrainer):
         # 目标客户端遗忘阶段：loss = CE_current + lambda * CE_prev_post(B)
         self.target_prev_ce_enabled = kwargs.get("target_prev_ce_enabled", False)
         self.target_prev_ce_weight = float(kwargs.get("target_prev_ce_weight", 1.0))
-        self.target_prev_ce_distill_weight = float(
-            kwargs.get("target_prev_ce_distill_weight", 0.0)
-        )
-        self.target_prev_ce_distill_temperature = float(
-            kwargs.get("target_prev_ce_distill_temperature", 1.0)
-        )
         self.prev_target_model_path = kwargs.get("prev_target_model_path", None)
         self.prev_target_model_post = None
         self.unlearn_base_full_rounds = kwargs.get("unlearn_base_full_rounds", None)
@@ -885,8 +878,8 @@ class FederatedPermTrainer(FinetuneTrainer):
 
     def _train_target_with_prev_teacher(self, trainer, student_model, teacher_model, device):
         """
-        使用固定 teacher 约束 student 的本地训练。
-        teacher 不更新，仅提供蒸馏信号。
+        使用“先更新 teacher，再更新 student”的交替方式训练目标客户端。
+        teacher 基于真实标签优化，随后固定 teacher，仅更新 student。
         """
         student_model = student_model.to(device)
         teacher_model = teacher_model.to(device)
@@ -898,15 +891,20 @@ class FederatedPermTrainer(FinetuneTrainer):
         grad_accum = max(1, getattr(args, "gradient_accumulation_steps", 1))
         num_epochs = int(getattr(args, "num_train_epochs", 1))
         max_grad_norm = getattr(args, "max_grad_norm", None)
-        distill_weight = float(self.target_prev_ce_distill_weight)
-        distill_temp = float(self.target_prev_ce_distill_temperature)
+        teacher_weight = float(self.target_prev_ce_weight)
 
+        teacher_opt = AdamW(
+            teacher_model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=getattr(args, "weight_decay", 0.0),
+        )
         student_opt = AdamW(
             student_model.parameters(),
             lr=args.learning_rate,
             weight_decay=getattr(args, "weight_decay", 0.0),
         )
 
+        teacher_opt.zero_grad(set_to_none=True)
         student_opt.zero_grad(set_to_none=True)
 
         for _ in range(num_epochs):
@@ -914,22 +912,24 @@ class FederatedPermTrainer(FinetuneTrainer):
             for step, batch in enumerate(dataloader):
                 batch = self._move_batch_to_device(batch, device)
 
-                # 固定 teacher，更新 student
+                # Step 1: 更新 teacher（CE + 真实标签）
+                teacher_loss = teacher_weight * teacher_model(**batch).loss / grad_accum
+                teacher_loss.backward()
+                if (step + 1) % grad_accum == 0:
+                    if max_grad_norm is not None:
+                        clip_grad_norm_(teacher_model.parameters(), max_grad_norm)
+                    teacher_opt.step()
+                    teacher_opt.zero_grad(set_to_none=True)
+
+                # Step 2: 固定 teacher，更新 student
                 teacher_model.eval()
                 with torch.no_grad():
-                    teacher_logits = teacher_model(**batch).logits
+                    teacher_const_loss = teacher_weight * teacher_model(**batch).loss
+                teacher_model.train()
 
-                student_outputs = student_model(**batch)
-                student_loss = student_outputs.loss
-                if distill_weight > 0:
-                    labels = batch.get("labels", None) if isinstance(batch, dict) else None
-                    distill_loss = self._compute_distill_kl(
-                        student_outputs.logits,
-                        teacher_logits,
-                        labels=labels,
-                        temperature=distill_temp,
-                    )
-                    student_loss = student_loss + distill_weight * distill_loss
+                student_loss = student_model(**batch).loss
+                # 加上常数项以保持 loss 形式一致（对梯度无影响）
+                student_loss = student_loss + teacher_const_loss.detach()
                 student_loss = student_loss / grad_accum
                 student_loss.backward()
                 if (step + 1) % grad_accum == 0:
@@ -941,28 +941,16 @@ class FederatedPermTrainer(FinetuneTrainer):
             # flush 残余梯度（处理非整除 grad_accum 的情况）
             if step >= 0 and (step + 1) % grad_accum != 0:
                 if max_grad_norm is not None:
+                    clip_grad_norm_(teacher_model.parameters(), max_grad_norm)
                     clip_grad_norm_(student_model.parameters(), max_grad_norm)
+                teacher_opt.step()
                 student_opt.step()
+                teacher_opt.zero_grad(set_to_none=True)
                 student_opt.zero_grad(set_to_none=True)
 
         student_model = student_model.cpu()
         teacher_model = teacher_model.cpu()
         return student_model
-
-    @staticmethod
-    def _compute_distill_kl(student_logits, teacher_logits, labels=None, temperature: float = 1.0):
-        """KL(student || teacher) over token distributions with optional label mask."""
-        temp = max(float(temperature), 1e-6)
-        student_log_probs = F.log_softmax(student_logits / temp, dim=-1)
-        teacher_probs = F.softmax(teacher_logits / temp, dim=-1)
-        kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(-1)
-        if labels is not None:
-            mask = labels != -100
-            kl = kl * mask
-            denom = mask.sum().clamp_min(1)
-        else:
-            denom = kl.numel()
-        return (kl.sum() / denom) * (temp ** 2)
 
     def _save_round_outputs(self, round_idx: int):
         """Persist server and target-client checkpoints for a given round."""
