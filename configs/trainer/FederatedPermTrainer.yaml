@@ -26,8 +26,6 @@ method_args:
   global_retain_indices: null         # Optional: pass merged retain indices
   global_forget_indices: null         # Optional: pass merged forget indices
   # 可选：目标客户端 B 的锚点正则（约束遗忘后回弹），默认关闭
-  target_anchor_reg_enabled: false
-  target_anchor_reg_lambda: 0.0
   # 可选：目标客户端 B 遗忘阶段附加上一轮 CE 监督
   target_prev_ce_enabled: false
   target_prev_ce_weight: 1.0

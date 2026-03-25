@@ -86,8 +86,6 @@ UNLEARN_EPOCHS=5   # 过滤器训练轮次
 FILTER_ALPHA=1     # θ_g^t-(θ_g^{t-1}-alpha*θ_unlearn)
 
 # 遗忘阶段目标客户端B本地LOSS正则锚点/双CE开关
-TARGET_ANCHOR_REG_ENABLED=false
-TARGET_ANCHOR_REG_LAMBDA=1
 
 TARGET_PREV_CE_ENABLED=true   # 目标客户端本地训练双CE开关
 TARGET_PREV_CE_WEIGHT=1     # θ_unlearn的微调项系数
@@ -344,8 +342,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
             trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
             trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
             trainer.method_args.eval_client_c_idx="${CLIENT_C_IDX}" \
-            trainer.method_args.target_anchor_reg_enabled="${TARGET_ANCHOR_REG_ENABLED}" \
-            trainer.method_args.target_anchor_reg_lambda="${TARGET_ANCHOR_REG_LAMBDA}" \
             trainer.method_args.target_prev_ce_enabled="${TARGET_PREV_CE_ENABLED}" \
             trainer.method_args.target_prev_ce_weight="${TARGET_PREV_CE_WEIGHT}" \
             +trainer.method_args.filter_base_model_path="${FILTER_BASE_DIR}" \

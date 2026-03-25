@@ -70,7 +70,7 @@ def main(cfg: DictConfig):
 
     if is_federated:
         num_clients = cfg.trainer.method_args.get("num_clients", 3)
-        retain_ratio = cfg.trainer.method_args.get("retain_ratio", 0.99)
+        retain_ratio = cfg.trainer.method_args.get("retain_ratio", 0.90)
         save_client_splits = cfg.trainer.method_args.get(
             "save_client_splits_for_eval", False
         )

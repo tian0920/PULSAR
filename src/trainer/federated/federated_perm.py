@@ -110,9 +110,6 @@ class FederatedPermTrainer(FinetuneTrainer):
         )
         # C 类客户端中用于评测的一个索引（可指定），默认取第一个非 A/B
         self.eval_client_c_idx = kwargs.get("eval_client_c_idx", None)
-        # 可选：目标客户端 B 的锚点正则（约束遗忘后的回弹）
-        self.target_anchor_reg_enabled = kwargs.get("target_anchor_reg_enabled", False)
-        self.target_anchor_reg_lambda = kwargs.get("target_anchor_reg_lambda", 0.0)
         # 目标客户端遗忘阶段：loss = CE_current + lambda * CE_prev_post(B)
         self.target_prev_ce_enabled = kwargs.get("target_prev_ce_enabled", False)
         self.target_prev_ce_weight = float(kwargs.get("target_prev_ce_weight", 1.0))
@@ -341,21 +338,6 @@ class FederatedPermTrainer(FinetuneTrainer):
                 client_initial_states[client_idx] = initial_state
 
                 logger.info(f"Queue training for client {client_idx}")
-                anchor_state = None
-                anchor_lambda = 0.0
-                if (
-                    self.revocation_status  # 仅遗忘阶段
-                    and self.target_anchor_reg_enabled
-                    and client_idx == self.target_client_idx
-                    and self.target_anchor_reg_lambda > 0
-                ):
-                    anchor_state = {
-                        name: param.detach().clone()
-                        for name, param in client_model.named_parameters()
-                        if param.requires_grad
-                    }
-                    anchor_lambda = float(self.target_anchor_reg_lambda)
-
                 prev_teacher = None
                 if (
                     self.revocation_status
@@ -372,8 +354,6 @@ class FederatedPermTrainer(FinetuneTrainer):
                     client_idx,
                     deepcopy(client_model).cpu(),
                     client_dataset,
-                    anchor_state,
-                    anchor_lambda,
                     prev_teacher,
                     self.train_device,
                 )
@@ -640,7 +620,7 @@ class FederatedPermTrainer(FinetuneTrainer):
         else:
             object.__setattr__(unlearn_args, "_n_gpu", 0)
 
-        # 遗忘起点：按 full+unlearn 连续轮次选择基线，否则用当前全局模型
+        # 遗忘起点：按 full+unlearn 连续轮次选择基线
         unlearn_init_model = deepcopy(self.model)
         base_path = self._resolve_unlearn_base_path(round_idx)
         if not os.path.isdir(base_path):
@@ -769,8 +749,6 @@ class FederatedPermTrainer(FinetuneTrainer):
         self,
         client_model,
         client_dataset,
-        anchor_state=None,
-        anchor_lambda: float = 0.0,
         prev_teacher=None,
         device=None,
     ):
@@ -796,35 +774,7 @@ class FederatedPermTrainer(FinetuneTrainer):
         )
 
         trained_model = None
-        # 可选：为目标客户端 B 添加 L2 锚点正则，抑制遗忘后回弹
-        if anchor_state is not None and anchor_lambda > 0:
-            base_compute_loss = trainer.compute_loss
-
-            def compute_loss_with_anchor(model, inputs, return_outputs=False, num_items_in_batch=None):
-                result = base_compute_loss(
-                    model,
-                    inputs,
-                    return_outputs=True,
-                    num_items_in_batch=num_items_in_batch,
-                )
-                if isinstance(result, tuple):
-                    base_loss, outputs = result
-                else:
-                    base_loss, outputs = result, None
-
-                reg = 0.0
-                for name, param in model.named_parameters():
-                    if not param.requires_grad:
-                        continue
-                    anchor = anchor_state.get(name)
-                    if anchor is None:
-                        continue
-                    reg = reg + torch.sum((param - anchor.to(param.device)) ** 2)
-                loss = base_loss + anchor_lambda * reg
-                return (loss, outputs) if return_outputs else loss
-
-            trainer.compute_loss = compute_loss_with_anchor
-        elif (
+        if (
             prev_teacher is not None
             and self.target_prev_ce_enabled
             and float(self.target_prev_ce_weight) != 0
@@ -847,16 +797,12 @@ class FederatedPermTrainer(FinetuneTrainer):
         client_idx: int,
         client_model,
         client_dataset,
-        anchor_state,
-        anchor_lambda: float,
         prev_teacher,
         device: torch.device,
     ):
         trained_model = self.train_client_model(
             client_model,
             client_dataset,
-            anchor_state=anchor_state,
-            anchor_lambda=anchor_lambda,
             prev_teacher=prev_teacher,
             device=device,
         )

@@ -138,51 +138,47 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                     param.requires_grad = True
             logger.info("Enabled gradients for PEFT adapter parameters before copying")
         
-        # Create a copy for unlearning (preserve training state)
-        unlearn_model = deepcopy(self.model)
-        # Ensure the copied model is also in training mode
-        unlearn_model.train()
-        
-        # After deepcopy, re-enable gradients for PEFT models
-        if isinstance(unlearn_model, PeftModel):
-            for name, param in unlearn_model.named_parameters():
-                if 'lora' in name.lower() or 'adapter' in name.lower():
-                    param.requires_grad = True
-            logger.info("Re-enabled gradients for PEFT adapter parameters after copying")
-        
-        logger.info(f"Step 1: Unlearning on target client {self.target_client_idx}")
-        unlearn_trainer = None
-        if self.target_client_idx in self.federated_dataset:
-            target_dataset = self.federated_dataset[self.target_client_idx]
-            unlearn_trainer = self.unlearn_client_model(unlearn_model, target_dataset)
-            logger.info("Completed unlearning on target client")
-            if self.init_all_clients_from_unlearn:
-                self._apply_theta_unlearn_state_to_global()
-            # 在目标客户端保留训练前保存“纯遗忘后”模型，便于单独评测遗忘效果
-            pre_retain_target_path = f"{self.args.output_dir}/pre_retain_target_client_{self.target_client_idx}"
-            os.makedirs(pre_retain_target_path, exist_ok=True)
-            tgt_model = unlearn_trainer.model.cpu()
-            if self.is_peft:
-                tgt_model.save_pretrained(pre_retain_target_path, safe_serialization=False)
-                if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(pre_retain_target_path, safe_serialization=False)
-            else:
-                torch.save(
-                    tgt_model.state_dict(),
-                    os.path.join(pre_retain_target_path, "pytorch_model.bin"),
-                )
-                if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(pre_retain_target_path, safe_serialization=False)
-            logger.info(
-                f"Saved pre-retain target client {self.target_client_idx} model at {pre_retain_target_path}"
-            )
-        else:
-            logger.warning(f"Target client {self.target_client_idx} has no data, skipping unlearning")
-    
         for round_idx in range(self.global_rounds):
             logger.info(f"Starting global round {round_idx + 1}/{self.global_rounds}")
-            
-    
+            logger.info(
+                "Step 1: Unlearning on revoker client %s with current global model",
+                self.revoker_client_idx,
+            )
+            unlearn_trainer = None
+            if self.revoker_client_idx in self.federated_dataset:
+                revoker_dataset = self.federated_dataset[self.revoker_client_idx]
+                unlearn_model = deepcopy(self.model)
+                unlearn_trainer = self.unlearn_client_model(unlearn_model, revoker_dataset)
+                logger.info("Completed unlearning on revoker client")
+                self._apply_theta_unlearn_state_to_global()
+                if round_idx == 0:
+                    pre_retain_target_path = (
+                        f"{self.args.output_dir}/pre_retain_target_client_{self.revoker_client_idx}"
+                    )
+                    os.makedirs(pre_retain_target_path, exist_ok=True)
+                    tgt_model = unlearn_trainer.model.cpu()
+                    if self.is_peft:
+                        tgt_model.save_pretrained(pre_retain_target_path, safe_serialization=False)
+                        if self.tokenizer is not None:
+                            self.tokenizer.save_pretrained(pre_retain_target_path, safe_serialization=False)
+                    else:
+                        torch.save(
+                            tgt_model.state_dict(),
+                            os.path.join(pre_retain_target_path, "pytorch_model.bin"),
+                        )
+                        if self.tokenizer is not None:
+                            self.tokenizer.save_pretrained(pre_retain_target_path, safe_serialization=False)
+                    logger.info(
+                        "Saved pre-retain revoker client %s model at %s",
+                        self.revoker_client_idx,
+                        pre_retain_target_path,
+                    )
+            else:
+                logger.warning(
+                    "Revoker client %s has no data, skipping unlearning",
+                    self.revoker_client_idx,
+                )
+
             logger.info("Step 2: All clients training on retain data with updated global model")
 
             # Server-side eval before broadcasting (聚合前评测)
@@ -551,7 +547,6 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
 
 
         forget_dataset = client_dataset.forget
-        retain_dataset = client_dataset.retain
 
         # 展开可能的嵌套 ForgetRetainDataset，拿到底层真实数据集
         from data.unlearn import ForgetRetainDataset
@@ -559,31 +554,22 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             forget_dataset, "forget", None
         ) is not None:
             forget_dataset = forget_dataset.forget
-        if isinstance(retain_dataset, ForgetRetainDataset) and getattr(
-            retain_dataset, "retain", None
-        ) is not None:
-            retain_dataset = retain_dataset.retain
-        retain_data = self._resolve_retain_data(retain_dataset)
 
         logger.info(f"forget_data length: {len(forget_dataset)}")
-        logger.info(f"retain_data length: {len(retain_data)}")
         logger.info(f"Unlearning_cls_name: {self.unlearn_trainer_cls}")
         
-        class CombinedDataset(Dataset):
-            def __init__(self, forget_data, retain_data):
+        class ForgetOnlyDataset(Dataset):
+            def __init__(self, forget_data):
                 self.forget_data = forget_data
-                self.retain_data = retain_data
-                self.retain_length = len(retain_data)
 
             def __len__(self):
                 return len(self.forget_data)
 
             def __getitem__(self, idx):
-                retain_idx = idx % self.retain_length
                 forget_item = self.forget_data[idx]
-                retain_item = self.retain_data[retain_idx]
                 if not (isinstance(forget_item, dict) and "forget" in forget_item):
                     forget_item = {"forget": forget_item}
+                retain_item = forget_item
                 if not (isinstance(retain_item, dict) and "retain" in retain_item):
                     retain_item = {"retain": retain_item}
                 return {
@@ -591,7 +577,7 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                     "retain": retain_item,
                 }
         
-        combined_dataset = CombinedDataset(forget_dataset, retain_data)
+        combined_dataset = ForgetOnlyDataset(forget_dataset)
 
         # Ensure model is in training mode and parameters are trainable.
         # Some PEFT checkpoints arrive with all params frozen, which would make loss.detach() with no grad_fn.
