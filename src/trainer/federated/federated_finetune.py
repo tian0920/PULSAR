@@ -10,6 +10,8 @@ from peft import PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
 from transformers.trainer_utils import IntervalStrategy, SaveStrategy
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,17 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         
         self.num_clients = num_clients
         self.target_client_idx = target_client_idx
+        self.revoker_client_idx = int(kwargs.get("revoker_client_idx", 0))
+        self.source_to_targets = self._resolve_source_to_targets(
+            kwargs.get("source_to_targets", None),
+            target_client_idx=target_client_idx,
+        )
+        self.source_client_indices = sorted(self.source_to_targets.keys())
+        self.target_client_indices = self._resolve_target_client_indices(
+            kwargs.get("target_client_indices", None),
+            target_client_idx=target_client_idx,
+            source_to_targets=self.source_to_targets,
+        )
         self.save_target_client_checkpoint = save_target_client_checkpoint
         self.aggregation_strategy = aggregation_strategy
         self.global_rounds = global_rounds
@@ -70,6 +83,11 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         # 单卡：客户端与服务器均使用同一设备
         self.train_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         self.server_device = self.train_device
+        self.client_parallel_devices = self._resolve_device_pool(
+            kwargs.get("client_parallel_devices", None),
+            fallback_device=self.train_device,
+        )
+        self.parallel_client_workers = int(kwargs.get("parallel_client_workers", 0))
         
 
         self.is_peft = isinstance(self.model, PeftModel)
@@ -110,8 +128,122 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         
         logger.info(f"Initialized with {num_clients} clients, global rounds: {global_rounds}")
         logger.info(f"Model type - PEFT: {self.is_peft}")
+        logger.info(f"Client parallel devices: {self.client_parallel_devices}, workers={self.parallel_client_workers}")
+        logger.info(f"Source clients for eval: {self.source_client_indices}")
         if self.save_target_client_checkpoint:
-            logger.info(f"Save target client checkpoint: {self.target_client_idx}")
+            logger.info(f"Save target client checkpoints: {self.target_client_indices}")
+
+    def _normalize_client_indices(self, client_indices):
+        normalized = []
+        for idx in client_indices or []:
+            client_idx = int(idx)
+            if client_idx < 0 or client_idx >= self.num_clients:
+                raise ValueError(
+                    f"Client index {client_idx} out of range for num_clients={self.num_clients}"
+                )
+            normalized.append(client_idx)
+        return sorted(dict.fromkeys(normalized))
+
+    def _resolve_source_to_targets(self, source_to_targets, target_client_idx: Optional[int]):
+        if source_to_targets is None:
+            return {}
+        normalized = {}
+        for raw_src, raw_targets in source_to_targets.items():
+            src_idx = int(raw_src)
+            if src_idx < 0 or src_idx >= self.num_clients:
+                raise ValueError(
+                    f"Source client index {src_idx} out of range for num_clients={self.num_clients}"
+                )
+            target_indices = self._normalize_client_indices(raw_targets)
+            if src_idx in target_indices:
+                raise ValueError(
+                    f"Source client {src_idx} cannot target itself in source_to_targets"
+                )
+            normalized[src_idx] = target_indices
+        return normalized
+
+    def _resolve_target_client_indices(
+        self,
+        configured_target_indices,
+        target_client_idx: Optional[int],
+        source_to_targets: Dict[int, List[int]],
+    ) -> List[int]:
+        resolved = self._normalize_client_indices(configured_target_indices)
+        if resolved:
+            return resolved
+        if source_to_targets:
+            target_indices = []
+            for values in source_to_targets.values():
+                target_indices.extend(values)
+            return self._normalize_client_indices(target_indices)
+        if target_client_idx is not None:
+            return [int(target_client_idx)]
+        return []
+
+    def _resolve_device_pool(self, configured_devices, fallback_device: torch.device) -> List[torch.device]:
+        if configured_devices:
+            devices = []
+            for device_spec in configured_devices:
+                device = device_spec if isinstance(device_spec, torch.device) else torch.device(str(device_spec))
+                if device.type == "cuda" and not torch.cuda.is_available():
+                    logger.warning(f"CUDA device {device} requested but CUDA is unavailable; skipping it")
+                    continue
+                if device.type == "cuda" and device.index is not None and device.index >= torch.cuda.device_count():
+                    logger.warning(f"CUDA device {device} requested but only {torch.cuda.device_count()} devices are available; skipping it")
+                    continue
+                devices.append(device)
+            if devices:
+                return devices
+
+        if torch.cuda.is_available():
+            return [torch.device(f"cuda:{idx}") for idx in range(torch.cuda.device_count())]
+        return [fallback_device]
+
+    def _resolve_worker_count(self, requested_workers: int, task_count: int, device_pool: List[torch.device]) -> int:
+        if task_count <= 1:
+            return 1
+        if not device_pool:
+            return 1
+        has_cuda = any(device.type == "cuda" for device in device_pool)
+        if requested_workers <= 0:
+            if has_cuda:
+                requested_workers = len(device_pool)
+            else:
+                requested_workers = 1
+        if requested_workers <= 1:
+            return 1
+        if has_cuda:
+            return max(1, min(requested_workers, len(device_pool), task_count))
+        return max(1, min(requested_workers, task_count))
+
+    def _run_parallel_tasks(self, task_specs, worker_fn, device_pool, requested_workers, task_label: str):
+        task_count = len(task_specs)
+        if task_count == 0:
+            return []
+        devices = device_pool or [torch.device("cpu")]
+        worker_count = self._resolve_worker_count(requested_workers, task_count, devices)
+        if worker_count <= 1:
+            logger.info(f"Running {task_count} {task_label} tasks sequentially")
+            return [worker_fn(task_spec, devices[idx % len(devices)]) for idx, task_spec in enumerate(task_specs)]
+
+        logger.info(
+            "Running %s %s tasks in parallel with %s workers on devices %s",
+            task_count,
+            task_label,
+            worker_count,
+            devices,
+        )
+        futures = {}
+        results = [None] * task_count
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for idx, task_spec in enumerate(task_specs):
+                device = devices[idx % len(devices)]
+                future = executor.submit(worker_fn, task_spec, device)
+                futures[future] = idx
+            for future in as_completed(futures):
+                result_idx = futures[future]
+                results[result_idx] = future.result()
+        return results
 
     def train(self, **kwargs):
 
@@ -142,7 +274,7 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
 
 
             logger.info(f"Aggregation strategy: {self.aggregation_strategy}")
-            logger.info(f"Training clients sequentially on device {self.train_device}")
+            client_task_specs = []
             for client_idx in range(self.num_clients):
                 if client_idx not in self.federated_dataset:
                     logger.warning(f"Skipping client {client_idx} as no data is available")
@@ -170,12 +302,29 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                             stage=stage_name,
                         )
 
-                client_idx, trained_client_model = self._train_client_task(
-                    client_idx,
-                    deepcopy(client_model).cpu(),
-                    client_dataset,
-                    device=self.train_device,
+                client_task_specs.append(
+                    {
+                        "client_idx": client_idx,
+                        "client_model": deepcopy(client_model).cpu(),
+                        "client_dataset": client_dataset,
+                    }
                 )
+
+            def _train_worker(task_spec, device):
+                return self._train_client_task(
+                    task_spec["client_idx"],
+                    task_spec["client_model"],
+                    task_spec["client_dataset"],
+                    device=device,
+                )
+
+            for client_idx, trained_client_model in self._run_parallel_tasks(
+                client_task_specs,
+                _train_worker,
+                self.client_parallel_devices,
+                self.parallel_client_workers,
+                task_label="client-train",
+            ):
                 self.client_models[client_idx] = trained_client_model
 
             # Client-side eval after local training（串行以避免 evaluator 并发冲突）
@@ -213,33 +362,34 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         return None
 
     def _maybe_save_target_client(self, round_idx: int):
-        """Optionally persist the target client's post-train checkpoint."""
+        """Optionally persist target clients' post-train checkpoints."""
         if not self.save_target_client_checkpoint:
             return
-        if self.target_client_idx is None or self.target_client_idx < 0:
-            logger.warning("save_target_client_checkpoint enabled but target_client_idx is invalid; skip.")
+        if not self.target_client_indices:
+            logger.warning("save_target_client_checkpoint enabled but no target clients are resolved; skip.")
             return
-        if self.target_client_idx >= len(self.client_models):
-            logger.warning(
-                f"target_client_idx {self.target_client_idx} out of range for {len(self.client_models)} clients; skip."
-            )
-            return
-        target_client_model = self.client_models[self.target_client_idx]
-        if target_client_model is None:
-            logger.warning(f"Target client {self.target_client_idx} model missing; skip.")
-            return
-        target_dir = f"{self.args.output_dir}/round_{round_idx + 1}_target_client_{self.target_client_idx}"
-        os.makedirs(target_dir, exist_ok=True)
-        if self.is_peft:
-            logger.info(
-                f"Saving target client {self.target_client_idx} PEFT model to {target_dir} (model only)"
-            )
-            target_client_model = target_client_model.cpu()
-            target_client_model.save_pretrained(target_dir, safe_serialization=False)
-        else:
-            target_client_model = target_client_model.cpu()
-            torch.save(target_client_model.state_dict(), os.path.join(target_dir, "pytorch_model.bin"))
-        logger.info(f"Target client {self.target_client_idx} model saved at {target_dir}")
+        for target_client_idx in self.target_client_indices:
+            if target_client_idx >= len(self.client_models):
+                logger.warning(
+                    f"target_client_idx {target_client_idx} out of range for {len(self.client_models)} clients; skip."
+                )
+                continue
+            target_client_model = self.client_models[target_client_idx]
+            if target_client_model is None:
+                logger.warning(f"Target client {target_client_idx} model missing; skip.")
+                continue
+            target_dir = f"{self.args.output_dir}/round_{round_idx + 1}_target_client_{target_client_idx}"
+            os.makedirs(target_dir, exist_ok=True)
+            if self.is_peft:
+                logger.info(
+                    f"Saving target client {target_client_idx} PEFT model to {target_dir} (model only)"
+                )
+                target_client_model = target_client_model.cpu()
+                target_client_model.save_pretrained(target_dir, safe_serialization=False)
+            else:
+                target_client_model = target_client_model.cpu()
+                torch.save(target_client_model.state_dict(), os.path.join(target_dir, "pytorch_model.bin"))
+            logger.info(f"Target client {target_client_idx} model saved at {target_dir}")
 
     def train_client_model(self, client_model, client_dataset, device=None):
         # Move client model to GPU if available (Trainer will handle device placement, but we ensure it's on GPU)
@@ -337,6 +487,61 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         )
         return client_idx, trained_client_model
 
+    def _clear_evaluator_cache(self):
+        if hasattr(self.evaluator, "metrics"):
+            for metric in self.evaluator.metrics.values():
+                if hasattr(metric, "data"):
+                    metric.data = None
+                if hasattr(metric, "collators"):
+                    metric.collators = None
+
+    def _resolve_eval_retain_indices_path(self, stage: str):
+        split_dir = os.environ.get(
+            "FEDPERM_SPLIT_DIR", os.path.join(self.args.output_dir, "client_splits")
+        )
+        retain_idx_path = None
+        m = re.match(r"client(\d+)_", stage)
+        if stage.startswith("server"):
+            retain_idx_path = os.path.join(split_dir, "global_retain_indices.json")
+        elif m:
+            cidx = int(m.group(1))
+            retain_idx_path = os.path.join(split_dir, f"client{cidx}_retain_indices.json")
+        return split_dir, retain_idx_path
+
+    def _set_eval_indices(self, stage: str, forget_source_idx: int):
+        split_dir, retain_idx_path = self._resolve_eval_retain_indices_path(stage)
+        forget_idx_path = os.path.join(
+            split_dir, f"client{forget_source_idx}_forget_indices.json"
+        )
+
+        if hasattr(self.evaluator, "eval_cfg"):
+            if hasattr(self.evaluator.eval_cfg, "tofu"):
+                eval_tofu = self.evaluator.eval_cfg.tofu
+                if not os.path.exists(forget_idx_path):
+                    raise FileNotFoundError(
+                        f"Forget indices missing for stage {stage}: {forget_idx_path}"
+                    )
+                eval_tofu.forget_indices_path = forget_idx_path
+                if retain_idx_path:
+                    if not os.path.exists(retain_idx_path):
+                        raise FileNotFoundError(
+                            f"Retain indices missing for stage {stage}: {retain_idx_path}"
+                        )
+                    eval_tofu.retain_indices_path = retain_idx_path
+
+            if hasattr(self.evaluator.eval_cfg, "muse"):
+                eval_muse = self.evaluator.eval_cfg.muse
+                if not os.path.exists(forget_idx_path):
+                    raise FileNotFoundError(
+                        f"MUSE forget indices missing for stage {stage}: {forget_idx_path}"
+                    )
+                eval_muse.forget_indices_path = forget_idx_path
+
+        self._clear_evaluator_cache()
+
+    def _forget_eval_sources(self):
+        return self.source_client_indices or [self.revoker_client_idx]
+
     def _maybe_evaluate_model(self, model, round_idx: int, stage: str):
         """
         Run evaluator (if provided) and save SUMMARY.json for the given stage.
@@ -348,24 +553,7 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 f"Skipping pre eval for stage {stage} due to ENABLE_PRE_EVAL={self.enable_pre_eval}"
             )
             return
-        eval_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx + 1}",
-            stage,
-        )
-        os.makedirs(eval_dir, exist_ok=True)
-
-        summary_file = os.path.join(eval_dir, "TOFU_SUMMARY.json")
-        summary_exists = os.path.isfile(summary_file) and os.path.getsize(summary_file) > 0
-
-        # If summary exists and no force flag, skip to save time
         force_eval = os.environ.get("FORCE_FEDPERM_EVAL", "0") in ("1", "true", "True")
-        if summary_exists and not force_eval:
-            logger.info(
-                f"Skipping eval for stage {stage} at round {round_idx + 1}, existing summary: {summary_file}"
-            )
-            return
 
         # Move model to GPU if available for faster evaluation
         model_was_on_cpu = next(model.parameters()).device.type == "cpu"
@@ -380,20 +568,68 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
             overwrite = getattr(self.evaluator.eval_cfg, "overwrite", True)
 
         try:
-            self.evaluator.evaluate(
-                model=model,
-                tokenizer=self.tokenizer,
-                template_args=self.template_args,
-                output_dir=eval_dir,
-                overwrite=overwrite,
-            )
-        except Exception as exc:
-            logger.warning(f"Evaluation failed at {stage} (round {round_idx}): {exc}")
+            forget_sources = self._forget_eval_sources()
+            for forget_source_idx in forget_sources:
+                eval_stage = (
+                    stage
+                    if len(forget_sources) == 1
+                    else f"{stage}__forget_src_{forget_source_idx}"
+                )
+                eval_dir = os.path.join(
+                    self.args.output_dir,
+                    "eval_rounds",
+                    f"round_{round_idx + 1}",
+                    eval_stage,
+                )
+                os.makedirs(eval_dir, exist_ok=True)
+
+                summary_file = os.path.join(eval_dir, "TOFU_SUMMARY.json")
+                summary_exists = os.path.isfile(summary_file) and os.path.getsize(summary_file) > 0
+                if summary_exists and not force_eval:
+                    logger.info(
+                        f"Skipping eval for stage {eval_stage} at round {round_idx + 1}, existing summary: {summary_file}"
+                    )
+                    continue
+
+                try:
+                    self._set_eval_indices(stage, forget_source_idx)
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to set eval indices for stage {eval_stage}: {exc}"
+                    )
+                    continue
+
+                try:
+                    self.evaluator.evaluate(
+                        model=model,
+                        tokenizer=self.tokenizer,
+                        template_args=self.template_args,
+                        output_dir=eval_dir,
+                        overwrite=overwrite,
+                    )
+                except Exception as exc:
+                    logger.warning(f"Evaluation failed at {eval_stage} (round {round_idx}): {exc}")
         finally:
             # Move model back to CPU if it was originally on CPU (to save GPU memory)
             if torch.cuda.is_available() and model_was_on_cpu:
                 model = model.cpu()
                 torch.cuda.empty_cache()
+
+    def _copy_eval_stage_outputs(self, src_dir: str, dest_dir: str) -> bool:
+        if not os.path.isdir(src_dir):
+            return False
+        src_summary = os.path.join(src_dir, "TOFU_SUMMARY.json")
+        if not os.path.isfile(src_summary):
+            return False
+
+        os.makedirs(dest_dir, exist_ok=True)
+        copied = False
+        for fname in os.listdir(src_dir):
+            src = os.path.join(src_dir, fname)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(dest_dir, fname))
+                copied = True
+        return copied
 
     def _reuse_server_post_eval(self, round_idx: int, target_stage: str) -> bool:
         """
@@ -401,30 +637,32 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         """
         if self.evaluator is None or round_idx == 0:
             return False
-        prev_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx}",
-            "server_post_agg",
-        )
-        src_summary = os.path.join(prev_dir, "TOFU_SUMMARY.json")
-        if not os.path.isfile(src_summary):
-            return False
-
-        dest_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx + 1}",
-            target_stage,
-        )
-        os.makedirs(dest_dir, exist_ok=True)
-
         copied = False
-        for fname in os.listdir(prev_dir):
-            src = os.path.join(prev_dir, fname)
-            if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(dest_dir, fname))
-                copied = True
+        forget_sources = self._forget_eval_sources()
+        for forget_source_idx in forget_sources:
+            src_stage = (
+                "server_post_agg"
+                if len(forget_sources) == 1
+                else f"server_post_agg__forget_src_{forget_source_idx}"
+            )
+            dest_stage = (
+                target_stage
+                if len(forget_sources) == 1
+                else f"{target_stage}__forget_src_{forget_source_idx}"
+            )
+            prev_dir = os.path.join(
+                self.args.output_dir,
+                "eval_rounds",
+                f"round_{round_idx}",
+                src_stage,
+            )
+            dest_dir = os.path.join(
+                self.args.output_dir,
+                "eval_rounds",
+                f"round_{round_idx + 1}",
+                dest_stage,
+            )
+            copied = self._copy_eval_stage_outputs(prev_dir, dest_dir) or copied
         if copied:
             logger.info(
                 f"Reused server_post_agg eval (round {round_idx}) for stage {target_stage}"
@@ -437,29 +675,32 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         """
         if self.evaluator is None:
             return False
-        src_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx + 1}",
-            "server_pre_agg",
-        )
-        src_summary = os.path.join(src_dir, "TOFU_SUMMARY.json")
-        if not os.path.isfile(src_summary):
-            return False
-
-        dest_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx + 1}",
-            target_stage,
-        )
-        os.makedirs(dest_dir, exist_ok=True)
         copied = False
-        for fname in os.listdir(src_dir):
-            src = os.path.join(src_dir, fname)
-            if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(dest_dir, fname))
-                copied = True
+        forget_sources = self._forget_eval_sources()
+        for forget_source_idx in forget_sources:
+            src_stage = (
+                "server_pre_agg"
+                if len(forget_sources) == 1
+                else f"server_pre_agg__forget_src_{forget_source_idx}"
+            )
+            dest_stage = (
+                target_stage
+                if len(forget_sources) == 1
+                else f"{target_stage}__forget_src_{forget_source_idx}"
+            )
+            src_dir = os.path.join(
+                self.args.output_dir,
+                "eval_rounds",
+                f"round_{round_idx + 1}",
+                src_stage,
+            )
+            dest_dir = os.path.join(
+                self.args.output_dir,
+                "eval_rounds",
+                f"round_{round_idx + 1}",
+                dest_stage,
+            )
+            copied = self._copy_eval_stage_outputs(src_dir, dest_dir) or copied
         if copied:
             logger.info(
                 f"Reused server_pre_agg eval (round {round_idx + 1}) for stage {target_stage}"

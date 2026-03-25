@@ -23,6 +23,45 @@ compute_skip_rounds() {
   echo "${skip%,}"
 }
 
+resolve_forget_sources_common() {
+  local split_dir="${1:-${COMMON_SPLIT_DIR:-}}"
+  SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-}" \
+  REVOKER_CLIENT_IDX="${REVOKER_CLIENT_IDX:-}" \
+  python3 - "$split_dir" <<'PY'
+import json
+import os
+import sys
+
+split_dir = sys.argv[1] if len(sys.argv) > 1 else ""
+topology = None
+env_mapping = os.environ.get("SOURCE_TO_TARGETS", "").strip()
+if env_mapping:
+    try:
+        topology = json.loads(env_mapping)
+    except Exception:
+        topology = None
+
+if topology is None and split_dir:
+    path = os.path.join(split_dir, "fedperm_topology.json")
+    if os.path.isfile(path):
+        with open(path, "r") as f:
+            payload = json.load(f)
+        topology = payload.get("source_to_targets")
+
+sources = set()
+if topology:
+    for key in topology.keys():
+        sources.add(int(key))
+
+if not sources:
+    fallback = os.environ.get("REVOKER_CLIENT_IDX", "").strip()
+    if fallback:
+        sources.add(int(fallback))
+
+print(",".join(str(v) for v in sorted(sources)))
+PY
+}
+
 # Decide whether to run eval for a checkpoint; respects SAVE_INTERVAL and LAST_ROUND.
 maybe_run_eval() {
   local ckpt_dir="$1"
@@ -39,15 +78,27 @@ maybe_run_eval() {
     fi
   fi
 
+  local all_exist=true
+  for summary_file in "${summary_paths[@]}"; do
+    if [ ! -s "${summary_file}" ]; then
+      all_exist=false
+      continue
+    fi
+    # treat "{}" or empty summary as missing to avoid skipping real eval
+    if [ "$(wc -c <"${summary_file}")" -le 3 ]; then
+      echo "Found placeholder summary (<=3 bytes), will re-evaluate: ${summary_file}"
+      all_exist=false
+      continue
+    fi
+  done
+  if [ "${#summary_paths[@]}" -gt 0 ] && [ "${all_exist}" = true ]; then
+    echo "Skip eval ${stage}, summaries already exist: ${summary_paths[*]}"
+    return
+  fi
+
   for summary_file in "${summary_paths[@]}"; do
     if [ -s "${summary_file}" ]; then
-      # treat "{}" or empty summary as missing to avoid skipping real eval
-      if [ "$(wc -c <"${summary_file}")" -le 3 ]; then
-        echo "Found placeholder summary (<=3 bytes), will re-evaluate: ${summary_file}"
-        continue
-      fi
-      echo "Skip eval ${stage}, summary already exists: ${summary_file}"
-      return
+      echo "Existing summary will be refreshed if needed: ${summary_file}"
     fi
   done
 
@@ -62,18 +113,37 @@ eval_rounds_common() {
   if [ "${total_rounds}" -le 0 ]; then
     return
   fi
+  local forget_sources_csv
+  forget_sources_csv="$(resolve_forget_sources_common "${COMMON_SPLIT_DIR:-}")"
+  local forget_sources=()
+  if [ -n "${forget_sources_csv}" ]; then
+    IFS=',' read -ra forget_sources <<< "${forget_sources_csv}"
+  fi
   LAST_ROUND=${total_rounds}
   for ((r=1; r<=total_rounds; r++)); do
     CURRENT_ROUND=${r}
     local post="${base_dir}/round_${r}"
     if [ -d "${post}" ]; then
-      local post_summary_paths=(
-        "${post}/eval/${prefix}_round${r}_post_agg/TOFU_SUMMARY.json"
-        "${base_dir}/eval_rounds/round_${r}/server_post_agg/TOFU_SUMMARY.json"
-      )
-      maybe_run_eval "${post}" "${prefix}_round${r}_post_agg" \
-        "${LOG_ROOT}/${prefix}_round${r}_post_agg.txt" \
-        "${post_summary_paths[@]}"
+      if [ "${#forget_sources[@]}" -le 1 ]; then
+        local post_summary_paths=(
+          "${post}/eval/${prefix}_round${r}_post_agg/TOFU_SUMMARY.json"
+          "${base_dir}/eval_rounds/round_${r}/server_post_agg/TOFU_SUMMARY.json"
+        )
+        maybe_run_eval "${post}" "${prefix}_round${r}_post_agg" \
+          "${LOG_ROOT}/${prefix}_round${r}_post_agg.txt" \
+          "${post_summary_paths[@]}"
+      else
+        for forget_src in "${forget_sources[@]}"; do
+          local stage_name="${prefix}_round${r}_post_agg__forget_src_${forget_src}"
+          local post_summary_paths=(
+            "${post}/eval/${stage_name}/TOFU_SUMMARY.json"
+            "${base_dir}/eval_rounds/round_${r}/server_post_agg__forget_src_${forget_src}/TOFU_SUMMARY.json"
+          )
+          maybe_run_eval "${post}" "${stage_name}" \
+            "${LOG_ROOT}/${stage_name}.txt" \
+            "${post_summary_paths[@]}"
+        done
+      fi
     else
       echo "⚠️ 缺少聚合后检查点：${post}"
     fi
@@ -88,13 +158,26 @@ eval_rounds_common() {
       fi
       local pre="${base_dir}/round_${pre_round}"
       if [ -d "${pre}" ]; then
-        local pre_summary_paths=(
-          "${pre}/eval/${prefix}_round${r}_pre_agg/TOFU_SUMMARY.json"
-          "${base_dir}/eval_rounds/round_${r}/server_pre_agg/TOFU_SUMMARY.json"
-        )
-        maybe_run_eval "${pre}" "${prefix}_round${r}_pre_agg" \
-          "${LOG_ROOT}/${prefix}_round${r}_pre_agg.txt" \
-          "${pre_summary_paths[@]}"
+        if [ "${#forget_sources[@]}" -le 1 ]; then
+          local pre_summary_paths=(
+            "${pre}/eval/${prefix}_round${r}_pre_agg/TOFU_SUMMARY.json"
+            "${base_dir}/eval_rounds/round_${r}/server_pre_agg/TOFU_SUMMARY.json"
+          )
+          maybe_run_eval "${pre}" "${prefix}_round${r}_pre_agg" \
+            "${LOG_ROOT}/${prefix}_round${r}_pre_agg.txt" \
+            "${pre_summary_paths[@]}"
+        else
+          for forget_src in "${forget_sources[@]}"; do
+            local stage_name="${prefix}_round${r}_pre_agg__forget_src_${forget_src}"
+            local pre_summary_paths=(
+              "${pre}/eval/${stage_name}/TOFU_SUMMARY.json"
+              "${base_dir}/eval_rounds/round_${r}/server_pre_agg__forget_src_${forget_src}/TOFU_SUMMARY.json"
+            )
+            maybe_run_eval "${pre}" "${stage_name}" \
+              "${LOG_ROOT}/${stage_name}.txt" \
+              "${pre_summary_paths[@]}"
+          done
+        fi
       fi
     fi
   done
@@ -145,8 +228,16 @@ run_eval_common() {
   if [ -n "${EVAL_GROUP:-}" ]; then
     extra_args+=(eval="${EVAL_GROUP}")
   fi
+  local inferred_forget_src=""
+  if [[ "${stage}" =~ __forget_src_([0-9]+)$ ]]; then
+    inferred_forget_src="${BASH_REMATCH[1]}"
+  fi
+
   if [ "${USE_CLIENT_FORGET_EVAL:-false}" = "true" ]; then
     local forget_idx_path="${forget_idx_override}"
+    if [ -n "${inferred_forget_src}" ] && [ -n "${COMMON_SPLIT_DIR:-}" ]; then
+      forget_idx_path="${COMMON_SPLIT_DIR}/client${inferred_forget_src}_forget_indices.json"
+    fi
     if [ -z "${forget_idx_path}" ] && [ -n "${COMMON_SPLIT_DIR:-}" ] && [ -n "${REVOKER_CLIENT_IDX:-}" ]; then
       forget_idx_path="${COMMON_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
     fi

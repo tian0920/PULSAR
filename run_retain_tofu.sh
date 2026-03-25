@@ -29,7 +29,18 @@ done
 IFS=',' read -ra FL_METHODS <<< "${FL_METHOD}"
 LAUNCHER=(python)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-echo "Single-GPU mode; using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "Visible CUDA devices: ${CUDA_VISIBLE_DEVICES}"
+
+PARALLEL_CLIENT_WORKERS="${PARALLEL_CLIENT_WORKERS:-0}"
+CLIENT_PARALLEL_DEVICES="${CLIENT_PARALLEL_DEVICES:-}"
+RETAIN_PARALLEL_ARGS=(
+  ++trainer.method_args.parallel_client_workers="${PARALLEL_CLIENT_WORKERS}"
+)
+if [ -n "${CLIENT_PARALLEL_DEVICES}" ]; then
+  RETAIN_PARALLEL_ARGS+=(
+    "++trainer.method_args.client_parallel_devices=[${CLIENT_PARALLEL_DEVICES}]"
+  )
+fi
 
 # 是否运行+保存所有 pre 评测，默认关闭以节省时间
 ENABLE_PRE_EVAL="${ENABLE_PRE_EVAL:-false}"
@@ -40,6 +51,16 @@ MODELS=("Llama-3.2-1B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1
 FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
 RETAIN_SPLITS=("retain90")
+NUM_CLIENTS="${NUM_CLIENTS:-10}"
+NUM_SOURCE_CLIENTS="${NUM_SOURCE_CLIENTS:-3}"
+NUM_TARGETS_PER_SOURCE="${NUM_TARGETS_PER_SOURCE:-3}"
+SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-}"      # 指定
+SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-}"
+RETAIN_CLIENT_WEIGHTS="${RETAIN_CLIENT_WEIGHTS:-}"
+FORGET_SOURCE_WEIGHTS="${FORGET_SOURCE_WEIGHTS:-}"
+
+LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+
 USE_CLIENT_FORGET_EVAL=true  # 是否在 forget_utility 中使用目标客户端的 forget 子集
 ASSIGN_FORGET_TO_REVOKER_ONLY=true   # 数据集划分方式
 if [ "${ASSIGN_FORGET_TO_REVOKER_ONLY}" = "true" ]; then
@@ -52,8 +73,42 @@ fi
 
 REVOKER_CLIENT_IDX=0
 
-GLOBAL_ROUNDS=20
-GLOBAL_ROUNDS=20
+TOPOLOGY_ARGS=(
+  ++trainer.method_args.num_clients="${NUM_CLIENTS}"
+  ++trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}"
+)
+if [ -n "${NUM_SOURCE_CLIENTS}" ]; then
+  TOPOLOGY_ARGS+=(
+    ++trainer.method_args.num_source_clients="${NUM_SOURCE_CLIENTS}"
+  )
+fi
+if [ -n "${NUM_TARGETS_PER_SOURCE}" ]; then
+  TOPOLOGY_ARGS+=(
+    ++trainer.method_args.num_targets_per_source="${NUM_TARGETS_PER_SOURCE}"
+  )
+fi
+if [ -n "${SOURCE_CLIENT_INDICES}" ]; then
+  TOPOLOGY_ARGS+=(
+    "++trainer.method_args.source_client_indices=[${SOURCE_CLIENT_INDICES}]"
+  )
+fi
+if [ -n "${SOURCE_TO_TARGETS}" ]; then
+  TOPOLOGY_ARGS+=(
+    "++trainer.method_args.source_to_targets=${SOURCE_TO_TARGETS}"
+  )
+fi
+if [ -n "${RETAIN_CLIENT_WEIGHTS}" ]; then
+  TOPOLOGY_ARGS+=(
+    "++trainer.method_args.retain_client_weights=${RETAIN_CLIENT_WEIGHTS}"
+  )
+fi
+if [ -n "${FORGET_SOURCE_WEIGHTS}" ]; then
+  TOPOLOGY_ARGS+=(
+    "++trainer.method_args.forget_source_weights=${FORGET_SOURCE_WEIGHTS}"
+  )
+fi
+
+GLOBAL_ROUNDS=10
 SAVE_INTERVAL=0              # 0 表示每轮保存；1 表示间隔一轮保存（1,3,5...），以此类推
 
 SEED=42
@@ -157,11 +212,13 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.method_args.global_rounds="${GLOBAL_ROUNDS}" \
           trainer.method_args.save_client_splits_for_eval="${SAVE_SPLITS_FOR_EVAL}" \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
-          trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
+          "${TOPOLOGY_ARGS[@]}" \
+          "${RETAIN_PARALLEL_ARGS[@]}" \
           trainer.args.output_dir="${RETAIN_DIR}" \
           trainer.args.save_strategy="epoch" \
           paths.output_dir="${RETAIN_DIR}" \
           trainer.args.seed="${SEED}" \
+          trainer.args.learning_rate="${LEARNING_RATE}" \
           "${EXTRA_EVAL_ARGS[@]}" \
           2>&1 | tee "${LOG_ROOT}/${RETAIN_TASK}.txt"
         if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then

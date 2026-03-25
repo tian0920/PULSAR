@@ -2,7 +2,7 @@
 # TL;DR: This file is used to register the datasets and collators
 
 from omegaconf import DictConfig
-from typing import Dict, Any, Union
+from typing import Dict, Any, Union, List, Optional
 from torch.utils.data import Subset, ConcatDataset
 import numpy as np
 import logging
@@ -28,6 +28,103 @@ class ClientFullRetainForget:
 
     def __len__(self):
         return len(self.full)
+
+
+def _normalize_client_index_list(client_indices, num_clients: int) -> List[int]:
+    if client_indices is None:
+        return []
+    normalized = []
+    for idx in client_indices:
+        client_idx = int(idx)
+        if client_idx < 0 or client_idx >= num_clients:
+            raise ValueError(
+                f"Client index {client_idx} out of range for num_clients={num_clients}"
+            )
+        normalized.append(client_idx)
+    return sorted(dict.fromkeys(normalized))
+
+
+def _normalize_weight_vector(
+    weights,
+    num_clients: int,
+    active_client_indices: Optional[List[int]] = None,
+) -> List[float]:
+    if active_client_indices is None:
+        active_client_indices = list(range(num_clients))
+    if not active_client_indices:
+        return [0.0] * num_clients
+
+    resolved = [0.0] * num_clients
+    if weights is None:
+        uniform = 1.0 / len(active_client_indices)
+        for client_idx in active_client_indices:
+            resolved[client_idx] = uniform
+        return resolved
+
+    if hasattr(weights, "items"):
+        for key, value in weights.items():
+            client_idx = int(key)
+            if client_idx < 0 or client_idx >= num_clients:
+                raise ValueError(
+                    f"Weight key client index {client_idx} out of range for num_clients={num_clients}"
+                )
+            resolved[client_idx] = float(value)
+    else:
+        weights_list = [float(v) for v in weights]
+        if len(weights_list) == num_clients:
+            resolved = weights_list
+        elif len(weights_list) == len(active_client_indices):
+            for client_idx, value in zip(active_client_indices, weights_list):
+                resolved[client_idx] = value
+        else:
+            raise ValueError(
+                f"Weight vector length {len(weights_list)} does not match "
+                f"num_clients={num_clients} or active_client_count={len(active_client_indices)}"
+            )
+
+    for client_idx, value in enumerate(resolved):
+        if value < 0:
+            raise ValueError(f"Weight for client {client_idx} must be non-negative, got {value}")
+
+    active_set = set(active_client_indices)
+    for client_idx, value in enumerate(resolved):
+        if client_idx not in active_set and value != 0:
+            raise ValueError(
+                f"Weight for inactive client {client_idx} must be 0, got {value}"
+            )
+
+    total = sum(resolved[client_idx] for client_idx in active_client_indices)
+    if total <= 0:
+        raise ValueError("Weights on active clients must sum to a positive value")
+
+    normalized = [0.0] * num_clients
+    for client_idx in active_client_indices:
+        normalized[client_idx] = resolved[client_idx] / total
+    return normalized
+
+
+def _allocate_counts(total_size: int, weights: List[float]) -> List[int]:
+    if total_size < 0:
+        raise ValueError(f"total_size must be non-negative, got {total_size}")
+    if total_size == 0:
+        return [0] * len(weights)
+
+    weight_sum = sum(weights)
+    if weight_sum <= 0:
+        raise ValueError("weights must sum to a positive value")
+
+    raw_counts = [total_size * (weight / weight_sum) for weight in weights]
+    counts = [int(np.floor(value)) for value in raw_counts]
+    remainder = total_size - sum(counts)
+    if remainder > 0:
+        ranked = sorted(
+            range(len(weights)),
+            key=lambda idx: (raw_counts[idx] - counts[idx], weights[idx], -idx),
+            reverse=True,
+        )
+        for idx in ranked[:remainder]:
+            counts[idx] += 1
+    return counts
 
 
 def _register_data(data_class):
@@ -136,6 +233,10 @@ def get_federated_full_retain_forget(
     seed: int = 0,
     assign_forget_to_revoker_only: bool = False,
     revoker_client_idx: int = 0,
+    source_client_indices=None,
+    source_to_targets=None,
+    retain_client_weights=None,
+    forget_source_weights=None,
     split_save_dir: str = None,
     retain_indices_path: str = None,
     forget_indices_path: str = None,
@@ -147,18 +248,34 @@ def get_federated_full_retain_forget(
     """
     Split data to clients.
     - 必须提供 retain_dataset/forget_dataset 或显式全局索引，才进行划分。
-    - retain_dataset / forget_dataset：默认分别均分到客户端，full 为两者的 concat。
-    - assign_forget_to_revoker_only=True 时，forget 全部分配给 revoker_client_idx（用于过滤器训练 / forget_utility 评测）。
+    - retain_dataset 按 retain_client_weights 划分到所有客户端，full 为 retain/forget concat。
+    - forget_dataset 仅分配给 source_client_indices，按 forget_source_weights 划分。
+    - 兼容旧配置：assign_forget_to_revoker_only=True 时，forget 全部分配给 revoker_client_idx。
     """
     import os
     import json
 
     dataset_size = len(full_dataset)
-    base_size = dataset_size // num_clients  # 仅用于全局索引分配
-    extras = dataset_size % num_clients
 
     rng = np.random.RandomState(seed)
     use_explicit_splits = retain_dataset is not None and forget_dataset is not None
+    source_client_indices = _normalize_client_index_list(source_client_indices, num_clients)
+    if source_to_targets is not None and not source_client_indices:
+        source_client_indices = _normalize_client_index_list(
+            source_to_targets.keys(), num_clients
+        )
+    if not source_client_indices:
+        if assign_forget_to_revoker_only:
+            source_client_indices = [int(revoker_client_idx)]
+        else:
+            source_client_indices = list(range(num_clients))
+
+    retain_weights = _normalize_weight_vector(retain_client_weights, num_clients)
+    forget_weights = _normalize_weight_vector(
+        forget_source_weights,
+        num_clients,
+        active_client_indices=source_client_indices,
+    )
 
     def _payload_to_lists(payload, fname="<payload>"):
         if isinstance(payload, dict):
@@ -212,38 +329,30 @@ def get_federated_full_retain_forget(
             )
             retain_indices.extend(r_list)
             forget_indices.extend(f_list)
-        retain_base = len(retain_indices) // num_clients
-        retain_extras = len(retain_indices) % num_clients
-        forget_base = len(forget_indices) // num_clients
-        forget_extras = len(forget_indices) % num_clients
         indices = None if use_explicit_splits else np.arange(dataset_size)
     elif use_explicit_splits:
         retain_indices = np.arange(len(retain_dataset))
         forget_indices = np.arange(len(forget_dataset))
         rng.shuffle(retain_indices)
         rng.shuffle(forget_indices)
-        retain_base = len(retain_indices) // num_clients
-        retain_extras = len(retain_indices) % num_clients
-        forget_base = len(forget_indices) // num_clients
-        forget_extras = len(forget_indices) % num_clients
         indices = None
     elif global_retain_indices is not None and global_forget_indices is not None:
         retain_indices = list(global_retain_indices)
         forget_indices = list(global_forget_indices)
         rng.shuffle(retain_indices)
         rng.shuffle(forget_indices)
-        retain_base = len(retain_indices) // num_clients
-        retain_extras = len(retain_indices) % num_clients
-        forget_base = len(forget_indices) // num_clients
-        forget_extras = len(forget_indices) % num_clients
         indices = np.arange(dataset_size)
     else:
         raise ValueError("Must provide retain/forget splits or explicit indices; fallback by retain_ratio is disabled.")
 
+    retain_counts = _allocate_counts(len(retain_indices), retain_weights)
+    forget_counts = _allocate_counts(len(forget_indices), forget_weights)
+
     client_datasets = {}
     retain_all_for_global = []
     forget_all_for_global = []
-    start_idx = 0
+    retain_offsets = np.cumsum([0] + retain_counts[:-1]).tolist()
+    forget_offsets = np.cumsum([0] + forget_counts[:-1]).tolist()
     for client_idx in range(num_clients):
         if use_saved_splits:
             payload = saved_split_payloads[client_idx]
@@ -259,19 +368,12 @@ def get_federated_full_retain_forget(
             else:
                 client_indices = None
         elif use_explicit_splits:
-            r_size = retain_base + (1 if client_idx < retain_extras else 0)
-            r_start = client_idx * retain_base + min(client_idx, retain_extras)
+            r_size = retain_counts[client_idx]
+            r_start = retain_offsets[client_idx]
             client_retain_indices = retain_indices[r_start : r_start + r_size]
-            if assign_forget_to_revoker_only:
-                client_forget_indices = (
-                    forget_indices.tolist()
-                    if client_idx == revoker_client_idx
-                    else []
-                )
-            else:
-                f_size = forget_base + (1 if client_idx < forget_extras else 0)
-                f_start = client_idx * forget_base + min(client_idx, forget_extras)
-                client_forget_indices = forget_indices[f_start : f_start + f_size]
+            f_size = forget_counts[client_idx]
+            f_start = forget_offsets[client_idx]
+            client_forget_indices = forget_indices[f_start : f_start + f_size]
             # Full indices are only for bookkeeping; actual subsets use respective datasets
             client_indices = None
             retain_indices_local = (
@@ -284,24 +386,17 @@ def get_federated_full_retain_forget(
             else:
                 forget_indices_local = list(client_forget_indices)
         elif global_retain_indices is not None and global_forget_indices is not None:
-            r_size = retain_base + (1 if client_idx < retain_extras else 0)
-            r_start = client_idx * retain_base + min(client_idx, retain_extras)
+            r_size = retain_counts[client_idx]
+            r_start = retain_offsets[client_idx]
             client_retain_indices = retain_indices[r_start : r_start + r_size]
-            if assign_forget_to_revoker_only:
-                client_forget_indices = (
-                    forget_indices.tolist()
-                    if client_idx == revoker_client_idx
-                    else []
-                )
-            else:
-                f_size = forget_base + (1 if client_idx < forget_extras else 0)
-                f_start = client_idx * forget_base + min(client_idx, forget_extras)
-                client_forget_indices = forget_indices[f_start : f_start + f_size]
+            f_size = forget_counts[client_idx]
+            f_start = forget_offsets[client_idx]
+            client_forget_indices = forget_indices[f_start : f_start + f_size]
             if hasattr(client_retain_indices, "tolist"):
                 client_retain_indices = client_retain_indices.tolist()
             if hasattr(client_forget_indices, "tolist"):
                 client_forget_indices = client_forget_indices.tolist()
-                client_indices = np.array(client_retain_indices + client_forget_indices)
+            client_indices = np.array(client_retain_indices + client_forget_indices)
             retain_indices_local = client_retain_indices
             forget_indices_local = client_forget_indices
         else:
@@ -364,6 +459,18 @@ def get_federated_full_retain_forget(
             json.dump(retain_all_for_global, f)
         with open(os.path.join(split_save_dir, "global_forget_indices.json"), "w") as f:
             json.dump(forget_all_for_global, f)
+        metadata = {
+            "num_clients": int(num_clients),
+            "source_client_indices": list(source_client_indices),
+            "source_to_targets": {
+                str(int(src_idx)): [int(tgt_idx) for tgt_idx in target_indices]
+                for src_idx, target_indices in (source_to_targets or {}).items()
+            },
+            "retain_client_weights": [float(v) for v in retain_weights],
+            "forget_source_weights": [float(v) for v in forget_weights],
+        }
+        with open(os.path.join(split_save_dir, "fedperm_topology.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
 
     return client_datasets
 
