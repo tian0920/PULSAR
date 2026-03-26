@@ -62,6 +62,48 @@ print(",".join(str(v) for v in sorted(sources)))
 PY
 }
 
+resolve_eval_forget_indices_common() {
+  local split_dir="$1"
+  local stage="$2"
+  local forget_source_idx="${3:-}"
+  SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-}" \
+  SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-}" \
+  python3 - "$split_dir" "$stage" "$forget_source_idx" <<'PY'
+import json
+import os
+import sys
+
+from trainer.federated.eval_routing import resolve_forget_indices_path
+
+split_dir, stage, forget_source_idx = sys.argv[1], sys.argv[2], sys.argv[3]
+raw_mapping = os.environ.get("SOURCE_TO_TARGETS", "").strip()
+raw_sources = os.environ.get("SOURCE_CLIENT_INDICES", "").strip()
+
+source_to_targets = {}
+if raw_mapping:
+    try:
+        source_to_targets = {
+            int(src): [int(idx) for idx in targets]
+            for src, targets in json.loads(raw_mapping).items()
+        }
+    except Exception:
+        source_to_targets = {}
+
+source_client_indices = []
+if raw_sources:
+    source_client_indices = [int(part) for part in raw_sources.split(",") if part.strip()]
+
+resolved = resolve_forget_indices_path(
+    split_dir=split_dir,
+    stage=stage,
+    source_to_targets=source_to_targets,
+    source_client_indices=source_client_indices,
+    forget_source_idx=int(forget_source_idx) if forget_source_idx else None,
+)
+print(resolved or "")
+PY
+}
+
 # Decide whether to run eval for a checkpoint; respects SAVE_INTERVAL and LAST_ROUND.
 maybe_run_eval() {
   local ckpt_dir="$1"
@@ -113,37 +155,18 @@ eval_rounds_common() {
   if [ "${total_rounds}" -le 0 ]; then
     return
   fi
-  local forget_sources_csv
-  forget_sources_csv="$(resolve_forget_sources_common "${COMMON_SPLIT_DIR:-}")"
-  local forget_sources=()
-  if [ -n "${forget_sources_csv}" ]; then
-    IFS=',' read -ra forget_sources <<< "${forget_sources_csv}"
-  fi
   LAST_ROUND=${total_rounds}
   for ((r=1; r<=total_rounds; r++)); do
     CURRENT_ROUND=${r}
     local post="${base_dir}/round_${r}"
     if [ -d "${post}" ]; then
-      if [ "${#forget_sources[@]}" -le 1 ]; then
-        local post_summary_paths=(
-          "${post}/eval/${prefix}_round${r}_post_agg/TOFU_SUMMARY.json"
-          "${base_dir}/eval_rounds/round_${r}/server_post_agg/TOFU_SUMMARY.json"
-        )
-        maybe_run_eval "${post}" "${prefix}_round${r}_post_agg" \
-          "${LOG_ROOT}/${prefix}_round${r}_post_agg.txt" \
-          "${post_summary_paths[@]}"
-      else
-        for forget_src in "${forget_sources[@]}"; do
-          local stage_name="${prefix}_round${r}_post_agg__forget_src_${forget_src}"
-          local post_summary_paths=(
-            "${post}/eval/${stage_name}/TOFU_SUMMARY.json"
-            "${base_dir}/eval_rounds/round_${r}/server_post_agg__forget_src_${forget_src}/TOFU_SUMMARY.json"
-          )
-          maybe_run_eval "${post}" "${stage_name}" \
-            "${LOG_ROOT}/${stage_name}.txt" \
-            "${post_summary_paths[@]}"
-        done
-      fi
+      local post_summary_paths=(
+        "${post}/eval/${prefix}_round${r}_post_agg/TOFU_SUMMARY.json"
+        "${base_dir}/eval_rounds/round_${r}/server_post_agg/TOFU_SUMMARY.json"
+      )
+      maybe_run_eval "${post}" "${prefix}_round${r}_post_agg" \
+        "${LOG_ROOT}/${prefix}_round${r}_post_agg.txt" \
+        "${post_summary_paths[@]}"
     else
       echo "⚠️ 缺少聚合后检查点：${post}"
     fi
@@ -158,26 +181,13 @@ eval_rounds_common() {
       fi
       local pre="${base_dir}/round_${pre_round}"
       if [ -d "${pre}" ]; then
-        if [ "${#forget_sources[@]}" -le 1 ]; then
-          local pre_summary_paths=(
-            "${pre}/eval/${prefix}_round${r}_pre_agg/TOFU_SUMMARY.json"
-            "${base_dir}/eval_rounds/round_${r}/server_pre_agg/TOFU_SUMMARY.json"
-          )
-          maybe_run_eval "${pre}" "${prefix}_round${r}_pre_agg" \
-            "${LOG_ROOT}/${prefix}_round${r}_pre_agg.txt" \
-            "${pre_summary_paths[@]}"
-        else
-          for forget_src in "${forget_sources[@]}"; do
-            local stage_name="${prefix}_round${r}_pre_agg__forget_src_${forget_src}"
-            local pre_summary_paths=(
-              "${pre}/eval/${stage_name}/TOFU_SUMMARY.json"
-              "${base_dir}/eval_rounds/round_${r}/server_pre_agg__forget_src_${forget_src}/TOFU_SUMMARY.json"
-            )
-            maybe_run_eval "${pre}" "${stage_name}" \
-              "${LOG_ROOT}/${stage_name}.txt" \
-              "${pre_summary_paths[@]}"
-          done
-        fi
+        local pre_summary_paths=(
+          "${pre}/eval/${prefix}_round${r}_pre_agg/TOFU_SUMMARY.json"
+          "${base_dir}/eval_rounds/round_${r}/server_pre_agg/TOFU_SUMMARY.json"
+        )
+        maybe_run_eval "${pre}" "${prefix}_round${r}_pre_agg" \
+          "${LOG_ROOT}/${prefix}_round${r}_pre_agg.txt" \
+          "${pre_summary_paths[@]}"
       fi
     fi
   done
@@ -235,11 +245,12 @@ run_eval_common() {
 
   if [ "${USE_CLIENT_FORGET_EVAL:-false}" = "true" ]; then
     local forget_idx_path="${forget_idx_override}"
-    if [ -n "${inferred_forget_src}" ] && [ -n "${COMMON_SPLIT_DIR:-}" ]; then
-      forget_idx_path="${COMMON_SPLIT_DIR}/client${inferred_forget_src}_forget_indices.json"
-    fi
-    if [ -z "${forget_idx_path}" ] && [ -n "${COMMON_SPLIT_DIR:-}" ] && [ -n "${REVOKER_CLIENT_IDX:-}" ]; then
-      forget_idx_path="${COMMON_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
+    if [ -n "${COMMON_SPLIT_DIR:-}" ]; then
+      if [ -n "${inferred_forget_src}" ]; then
+        forget_idx_path="$(resolve_eval_forget_indices_common "${COMMON_SPLIT_DIR}" "${stage}" "${inferred_forget_src}")"
+      elif [ -z "${forget_idx_path}" ]; then
+        forget_idx_path="$(resolve_eval_forget_indices_common "${COMMON_SPLIT_DIR}" "${stage}")"
+      fi
     fi
     if [ -n "${forget_idx_path}" ] && [ -f "${forget_idx_path}" ]; then
       extra_args+=(

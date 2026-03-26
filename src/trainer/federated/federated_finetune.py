@@ -12,6 +12,14 @@ import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
+from trainer.federated.eval_routing import (
+    build_eval_variants,
+    invert_source_to_targets,
+    parse_client_stage,
+    resolve_forget_indices_path,
+    resolve_server_post_reuse_stage,
+    resolve_server_pre_reuse_stage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +76,7 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
             target_client_idx=target_client_idx,
         )
         self.source_client_indices = sorted(self.source_to_targets.keys())
+        self.target_to_sources = invert_source_to_targets(self.source_to_targets)
         self.target_client_indices = self._resolve_target_client_indices(
             kwargs.get("target_client_indices", None),
             target_client_idx=target_client_idx,
@@ -510,14 +519,18 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
 
     def _set_eval_indices(self, stage: str, forget_source_idx: int):
         split_dir, retain_idx_path = self._resolve_eval_retain_indices_path(stage)
-        forget_idx_path = os.path.join(
-            split_dir, f"client{forget_source_idx}_forget_indices.json"
+        forget_idx_path = resolve_forget_indices_path(
+            split_dir=split_dir,
+            stage=stage,
+            source_to_targets=self.source_to_targets,
+            source_client_indices=self.source_client_indices,
+            forget_source_idx=forget_source_idx,
         )
 
         if hasattr(self.evaluator, "eval_cfg"):
             if hasattr(self.evaluator.eval_cfg, "tofu"):
                 eval_tofu = self.evaluator.eval_cfg.tofu
-                if not os.path.exists(forget_idx_path):
+                if not forget_idx_path or not os.path.exists(forget_idx_path):
                     raise FileNotFoundError(
                         f"Forget indices missing for stage {stage}: {forget_idx_path}"
                     )
@@ -569,12 +582,9 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
 
         try:
             forget_sources = self._forget_eval_sources()
-            for forget_source_idx in forget_sources:
-                eval_stage = (
-                    stage
-                    if len(forget_sources) == 1
-                    else f"{stage}__forget_src_{forget_source_idx}"
-                )
+            for eval_stage, forget_source_idx in build_eval_variants(
+                stage, forget_sources
+            ):
                 eval_dir = os.path.join(
                     self.args.output_dir,
                     "eval_rounds",
@@ -638,18 +648,16 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         if self.evaluator is None or round_idx == 0:
             return False
         copied = False
-        forget_sources = self._forget_eval_sources()
-        for forget_source_idx in forget_sources:
-            src_stage = (
-                "server_post_agg"
-                if len(forget_sources) == 1
-                else f"server_post_agg__forget_src_{forget_source_idx}"
+        client_idx = parse_client_stage(target_stage)
+        if client_idx is not None:
+            src_stage = resolve_server_post_reuse_stage(
+                target_stage=target_stage,
+                client_idx=client_idx,
+                source_to_targets=self.source_to_targets,
+                source_client_indices=self.source_client_indices,
             )
-            dest_stage = (
-                target_stage
-                if len(forget_sources) == 1
-                else f"{target_stage}__forget_src_{forget_source_idx}"
-            )
+            if src_stage is None:
+                return False
             prev_dir = os.path.join(
                 self.args.output_dir,
                 "eval_rounds",
@@ -660,9 +668,36 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 self.args.output_dir,
                 "eval_rounds",
                 f"round_{round_idx + 1}",
-                dest_stage,
+                target_stage,
             )
             copied = self._copy_eval_stage_outputs(prev_dir, dest_dir) or copied
+        else:
+            forget_sources = self._forget_eval_sources()
+            for eval_stage, forget_source_idx in build_eval_variants(
+                target_stage, forget_sources
+            ):
+                src_stage = (
+                    "server_post_agg"
+                    if forget_source_idx is None
+                    else (
+                        "server_post_agg"
+                        if len(forget_sources) == 1
+                        else f"server_post_agg__forget_src_{forget_source_idx}"
+                    )
+                )
+                prev_dir = os.path.join(
+                    self.args.output_dir,
+                    "eval_rounds",
+                    f"round_{round_idx}",
+                    src_stage,
+                )
+                dest_dir = os.path.join(
+                    self.args.output_dir,
+                    "eval_rounds",
+                    f"round_{round_idx + 1}",
+                    eval_stage,
+                )
+                copied = self._copy_eval_stage_outputs(prev_dir, dest_dir) or copied
         if copied:
             logger.info(
                 f"Reused server_post_agg eval (round {round_idx}) for stage {target_stage}"
@@ -676,18 +711,16 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         if self.evaluator is None:
             return False
         copied = False
-        forget_sources = self._forget_eval_sources()
-        for forget_source_idx in forget_sources:
-            src_stage = (
-                "server_pre_agg"
-                if len(forget_sources) == 1
-                else f"server_pre_agg__forget_src_{forget_source_idx}"
+        client_idx = parse_client_stage(target_stage)
+        if client_idx is not None:
+            src_stage = resolve_server_pre_reuse_stage(
+                target_stage=target_stage,
+                client_idx=client_idx,
+                source_to_targets=self.source_to_targets,
+                source_client_indices=self.source_client_indices,
             )
-            dest_stage = (
-                target_stage
-                if len(forget_sources) == 1
-                else f"{target_stage}__forget_src_{forget_source_idx}"
-            )
+            if src_stage is None:
+                return False
             src_dir = os.path.join(
                 self.args.output_dir,
                 "eval_rounds",
@@ -698,9 +731,36 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 self.args.output_dir,
                 "eval_rounds",
                 f"round_{round_idx + 1}",
-                dest_stage,
+                target_stage,
             )
             copied = self._copy_eval_stage_outputs(src_dir, dest_dir) or copied
+        else:
+            forget_sources = self._forget_eval_sources()
+            for eval_stage, forget_source_idx in build_eval_variants(
+                target_stage, forget_sources
+            ):
+                src_stage = (
+                    "server_pre_agg"
+                    if forget_source_idx is None
+                    else (
+                        "server_pre_agg"
+                        if len(forget_sources) == 1
+                        else f"server_pre_agg__forget_src_{forget_source_idx}"
+                    )
+                )
+                src_dir = os.path.join(
+                    self.args.output_dir,
+                    "eval_rounds",
+                    f"round_{round_idx + 1}",
+                    src_stage,
+                )
+                dest_dir = os.path.join(
+                    self.args.output_dir,
+                    "eval_rounds",
+                    f"round_{round_idx + 1}",
+                    eval_stage,
+                )
+                copied = self._copy_eval_stage_outputs(src_dir, dest_dir) or copied
         if copied:
             logger.info(
                 f"Reused server_pre_agg eval (round {round_idx + 1}) for stage {target_stage}"

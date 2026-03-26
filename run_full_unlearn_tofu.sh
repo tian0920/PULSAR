@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvg,FedAdam}" # FedAvg,FedAvgM,FedYogi,FedProx,FedAdam,FedAdagrad
+FL_METHOD="${FL_METHOD:-FedAvg,FedAvgM}" # FedAvg,FedAvgM,FedYogi,FedProx,FedAdam,FedAdagrad
 DEFAULT_UNLEARN_CLS=("GradAscent" "NPO" "SimNPO" "GradDiff")  # "NPO" "SimNPO" "GradAscent" "GradDiff"
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
@@ -83,8 +83,8 @@ RETAIN_SPLITS=("retain90")
 NUM_CLIENTS="${NUM_CLIENTS:-10}"
 NUM_SOURCE_CLIENTS="${NUM_SOURCE_CLIENTS:-3}"
 NUM_TARGETS_PER_SOURCE="${NUM_TARGETS_PER_SOURCE:-3}"
-SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-}"
-SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-}"
+SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-0,3,7}"      # 指定 "0,3,7"
+SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-{0:[1,2,4],3:[4,5,8],7:[3,6,8]}}"
 RETAIN_CLIENT_WEIGHTS="${RETAIN_CLIENT_WEIGHTS:-}"  # {0: 2, 1: 1, 2: 1, 3: 0.5}
 FORGET_SOURCE_WEIGHTS="${FORGET_SOURCE_WEIGHTS:-}"  # [0, 3, 7]
 USE_CLIENT_FORGET_EVAL=true   # forget_utility 是否用源客户端的 forget indices
@@ -142,18 +142,18 @@ fi
 FULL_GLOBAL_ROUNDS=4
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
 PRE_BASE_OFFSET="${PRE_BASE_OFFSET:-1}"  # 取最后几轮前的基线（默认 1）
-PRE_BASE_OFFSETS="1,2,3,4"  # 逗号分隔，遍历多个 offset
+PRE_BASE_OFFSETS="1"  # 逗号分隔，遍历多个 offset  ,2,3,4
 
 # 遗忘+恢复阶段（沿用 run_fedperm_only 的编排）
-UNLEARN_GLOBAL_ROUNDS=3
+UNLEARN_GLOBAL_ROUNDS=1
 NORMAL_BEFORE_FORGET=0
-FORGET_ROUNDS=3
-RECOVERY_START=3
+FORGET_ROUNDS=1
+RECOVERY_START=1
 UNLEARN_SAVE_INTERVAL=0  # unlearn 阶段：同上
 
 UNLEARN_EPOCHS=1   # 过滤器训练轮次
 FILTER_ALPHA=1     # θ_g^t-(θ_g^{t-1}-alpha*θ_unlearn)
-LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+LEARNING_RATE="${LEARNING_RATE:-8e-5}"
 
 # 遗忘阶段目标客户端B本地LOSS正则锚点/双CE开关
 

@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvgM}"
+FL_METHOD="${FL_METHOD:-FedAvg,FedAvgM}" # FedAvgM, FedAvg, FedYogi, FedProx, FedAdagrad, FedAdam
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fl-method)
@@ -54,12 +54,12 @@ RETAIN_SPLITS=("retain90")
 NUM_CLIENTS="${NUM_CLIENTS:-10}"
 NUM_SOURCE_CLIENTS="${NUM_SOURCE_CLIENTS:-3}"
 NUM_TARGETS_PER_SOURCE="${NUM_TARGETS_PER_SOURCE:-3}"
-SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-}"      # 指定
-SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-}"
+SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-0,3,7}"      # 指定 "0,3,7"
+SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-{0:[1,2,4],3:[4,5,8],7:[3,6,8]}}"    # 指定 '{"0":[1,2,4],"3":[4,5,8],"7":[3,6,8]}'
 RETAIN_CLIENT_WEIGHTS="${RETAIN_CLIENT_WEIGHTS:-}"
 FORGET_SOURCE_WEIGHTS="${FORGET_SOURCE_WEIGHTS:-}"
 
-LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+LEARNING_RATE="${LEARNING_RATE:-8e-5}"
 
 USE_CLIENT_FORGET_EVAL=true  # 是否在 forget_utility 中使用目标客户端的 forget 子集
 ASSIGN_FORGET_TO_REVOKER_ONLY=true   # 数据集划分方式
@@ -108,7 +108,7 @@ if [ -n "${FORGET_SOURCE_WEIGHTS}" ]; then
   )
 fi
 
-GLOBAL_ROUNDS=10
+GLOBAL_ROUNDS=5
 SAVE_INTERVAL=0              # 0 表示每轮保存；1 表示间隔一轮保存（1,3,5...），以此类推
 
 SEED=42

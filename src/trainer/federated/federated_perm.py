@@ -26,6 +26,11 @@ from trainer.unlearn.grad_diff import GradDiff
 from transformers import default_data_collator
 from torch.optim import AdamW
 from torch.nn.utils import clip_grad_norm_
+from trainer.federated.eval_routing import (
+    build_eval_variants,
+    resolve_forget_indices_path,
+    resolve_server_post_reuse_stage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -605,14 +610,18 @@ class FederatedPermTrainer(FinetuneTrainer):
 
     def _set_eval_indices(self, stage: str, forget_source_idx: int):
         split_dir, retain_idx_path = self._resolve_eval_retain_indices_path(stage)
-        forget_idx_path = os.path.join(
-            split_dir, f"client{forget_source_idx}_forget_indices.json"
+        forget_idx_path = resolve_forget_indices_path(
+            split_dir=split_dir,
+            stage=stage,
+            source_to_targets=self.source_to_targets,
+            source_client_indices=self.source_client_indices,
+            forget_source_idx=forget_source_idx,
         )
 
         if hasattr(self.evaluator, "eval_cfg"):
             if hasattr(self.evaluator.eval_cfg, "tofu"):
                 eval_tofu = self.evaluator.eval_cfg.tofu
-                if not os.path.exists(forget_idx_path):
+                if not forget_idx_path or not os.path.exists(forget_idx_path):
                     raise FileNotFoundError(
                         f"Forget indices missing for stage {stage}: {forget_idx_path}"
                     )
@@ -672,12 +681,9 @@ class FederatedPermTrainer(FinetuneTrainer):
             logger.info(f"Model moved to GPU device {device} for evaluation at stage {stage}")
 
         try:
-            for forget_source_idx in forget_sources:
-                eval_stage = (
-                    stage
-                    if len(forget_sources) == 1
-                    else f"{stage}__forget_src_{forget_source_idx}"
-                )
+            for eval_stage, forget_source_idx in build_eval_variants(
+                stage, forget_sources
+            ):
                 eval_dir = os.path.join(
                     self.args.output_dir,
                     "eval_rounds",
@@ -734,11 +740,19 @@ class FederatedPermTrainer(FinetuneTrainer):
         ):
             return False
 
+        src_stage = resolve_server_post_reuse_stage(
+            target_stage=target_stage,
+            client_idx=client_idx,
+            source_to_targets=self.source_to_targets,
+            source_client_indices=self.source_client_indices,
+        )
+        if src_stage is None:
+            return False
         prev_dir = os.path.join(
             self.args.output_dir,
             "eval_rounds",
             f"round_{round_idx}",
-            "server_post_agg",
+            src_stage,
         )
         src_summary = os.path.join(prev_dir, "TOFU_SUMMARY.json")
         if not os.path.isfile(src_summary):
@@ -961,6 +975,7 @@ class FederatedPermTrainer(FinetuneTrainer):
         self.target_filters = {}
         for target_client_idx, source_indices in self.target_to_sources.items():
             combined_filter = {}
+            contribution_counts = {}
             for src_idx in source_indices:
                 source_filter = self.source_filters.get(src_idx)
                 if source_filter is None:
@@ -971,8 +986,14 @@ class FederatedPermTrainer(FinetuneTrainer):
                         continue
                     if combined_filter.get(key) is None:
                         combined_filter[key] = value.detach().clone()
+                        contribution_counts[key] = 1
                     else:
                         combined_filter[key] = combined_filter[key] + value
+                        contribution_counts[key] = contribution_counts.get(key, 0) + 1
+            for key, value in list(combined_filter.items()):
+                count = contribution_counts.get(key, 0)
+                if value is not None and count > 1:
+                    combined_filter[key] = value / count
             if combined_filter:
                 self.target_filters[target_client_idx] = combined_filter
 
