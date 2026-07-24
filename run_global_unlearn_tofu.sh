@@ -23,6 +23,15 @@ export PYTORCH_SDPA_ENABLE_HEURISTIC=0
 # 是否运行+保存所有 pre 评测，默认关闭以节省时间
 ENABLE_PRE_EVAL="${ENABLE_PRE_EVAL:-false}"
 export ENABLE_PRE_EVAL
+# Target 客户端额外「当轮全部 source forget 合并」评测（与 full/retain 脚本一致）
+export EVAL_TARGET_ROUND_FORGET_MERGE="${EVAL_TARGET_ROUND_FORGET_MERGE:-true}"
+PARTICIPATION_RATIO="${PARTICIPATION_RATIO:-1}"
+MIN_PARTICIPATING_CLIENTS="${MIN_PARTICIPATING_CLIENTS:-1}"
+
+PARTICIPATION_ARGS=(
+  ++trainer.method_args.participation_ratio="${PARTICIPATION_RATIO}"
+  ++trainer.method_args.min_participating_clients="${MIN_PARTICIPATING_CLIENTS}"
+)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -205,7 +214,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
           trainer.method_args.save_client_splits_for_eval="${SAVE_SPLITS_FOR_EVAL}" \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
-          trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
+          "${PARTICIPATION_ARGS[@]}" \
           data/datasets@data.train=TOFU_QA_full \
           data.train.TOFU_QA_full.args.hf_args.name=full \
           trainer.args.output_dir="${FULL_DIR}" \
@@ -272,7 +281,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
             +trainer.method_args.init_all_clients_from_unlearn=true \
             trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
             +trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
-            +trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
+            "${PARTICIPATION_ARGS[@]}" \
             data/datasets@data.train=TOFU_QA_full \
             data.train.TOFU_QA_full.args.hf_args.name=full \
             model.model_args.pretrained_model_name_or_path="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}" \

@@ -25,7 +25,6 @@ DATASET_PATH="muse-bench/MUSE-News"
 DATASET_NAME="train"
 TEXT_KEY="text"
 
-USE_CLIENT_FORGET_EVAL=true   # forget_utility 是否用源客户端的 forget 子集
 ASSIGN_FORGET_TO_REVOKER_ONLY=true   # 数据集划分方式
 if [ "${ASSIGN_FORGET_TO_REVOKER_ONLY}" = "true" ]; then
   LOG_ROOT="logs/MUSE/fedperm_only"
@@ -38,7 +37,6 @@ fi
 # 强制评测使用 muse 组，避免 eval=tofu 时注入失败
 EVAL_GROUP="muse"
 
-REVOKER_CLIENT_IDX=0
 
 GLOBAL_ROUNDS=5
 SAVE_INTERVAL=0              # 0 表示每轮保存；1 表示间隔一轮保存（1,3,5...），以此类推
@@ -125,19 +123,12 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       RETAIN_TASK="retain_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}"
       RETAIN_DIR="${OUT_ROOT}/${RETAIN_TASK}"
       CLIENT_SPLIT_DIR="${RETAIN_DIR}/client_splits"
-      FORGET_IDX_PATH="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
       mkdir -p "${RETAIN_DIR}"
 
       if training_complete "${RETAIN_DIR}" "${GLOBAL_ROUNDS}"; then
         echo "Skip retain-only training, final round exists: ${RETAIN_DIR}/round_${GLOBAL_ROUNDS}"
       else
         EXTRA_EVAL_ARGS=()
-        if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
-          EXTRA_EVAL_ARGS+=(
-            +eval.muse.forget_indices_path="${FORGET_IDX_PATH}"
-            +eval.muse.forget_split="${FORGET_SPLIT}"
-          )
-        fi
         # 若公共划分已存在，直接复用，不再生成新划分
         if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
           EXTRA_EVAL_ARGS+=(
@@ -177,7 +168,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.method_args.global_rounds="${GLOBAL_ROUNDS}" \
           trainer.method_args.save_client_splits_for_eval=true \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
-          trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
           trainer.args.output_dir="${RETAIN_DIR}" \
           trainer.args.save_strategy="epoch" \
           paths.output_dir="${RETAIN_DIR}" \

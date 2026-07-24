@@ -107,6 +107,8 @@ class PDU(GradDiff):
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         forget_inputs = inputs["forget"]
+        if isinstance(forget_inputs, dict) and "forget" in forget_inputs:
+            forget_inputs = forget_inputs["forget"]
         forget_inputs = {
             "input_ids": forget_inputs["input_ids"],
             "attention_mask": forget_inputs["attention_mask"],
@@ -125,6 +127,8 @@ class PDU(GradDiff):
         forget_loss = (forget_loss * mask).sum() / mask.sum()
 
         retain_inputs = inputs["retain"]
+        if isinstance(retain_inputs, dict) and "retain" in retain_inputs:
+            retain_inputs = retain_inputs["retain"]
         retain_inputs = {
             "input_ids": retain_inputs["input_ids"],
             "attention_mask": retain_inputs["attention_mask"],

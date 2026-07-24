@@ -479,7 +479,9 @@ def get_federated_data(
     data,
     num_clients=3,
     target_client_idx=0,
+    source_client_indices=None,
     anchor="retain",
+    seed: int = 0,
 ):
     """
     Distribute data for federated learning scenarios
@@ -499,17 +501,24 @@ def get_federated_data(
     ):
         raise TypeError("Input datasets must be ForgetRetainDataset types")
 
-    # Split retain dataset
-    retain_len = len(original_retain.retain)  # Actual length of original retain data
+    source_client_indices = _normalize_client_index_list(
+        source_client_indices, num_clients
+    )
+    if not source_client_indices:
+        source_client_indices = [int(target_client_idx)]
+
+    # Randomly split retain dataset across clients.
+    retain_len = len(original_retain.retain)
     chunk_size = retain_len // num_clients
+    rng = np.random.RandomState(seed)
+    shuffled_indices = rng.permutation(retain_len).tolist()
     forget_base = getattr(original_forget, "forget", original_forget)
 
     client_datasets = {}
     for client_idx in range(num_clients):
-        # Split retain indices (based on actual length of original retain data)
         start = client_idx * chunk_size
         end = start + chunk_size if client_idx < num_clients - 1 else retain_len
-        retain_indices = list(range(start, end))
+        retain_indices = shuffled_indices[start:end]
 
         # Create client's retain dataset (keep ForgetRetainDataset type)
         client_retain = ForgetRetainDataset(
@@ -519,13 +528,13 @@ def get_federated_data(
         )
 
         # Assign forget data
-        if client_idx == target_client_idx:
-            # Target client gets full forget dataset
+        if client_idx in source_client_indices:
+            # Source client gets the forget dataset.
             client_forget = ForgetRetainDataset(
                 forget=forget_base, retain=None, anchor="forget"
             )
         else:
-            # Non-target client's forget is set to None
+            # Non-source clients do not receive forget data.
             client_forget = ForgetRetainDataset(
                 forget=None, retain=None, anchor="retain"
             )

@@ -2,9 +2,86 @@ import torch
 import logging
 import logging
 import copy
-from typing import List, Dict, Optional, Union, Tuple, Callable
+import math
+import random
+from typing import List, Dict, Optional, Union, Tuple, Callable, Iterable
 
 logger = logging.getLogger(__name__)
+
+
+def sample_participating_clients(
+    eligible_clients: Iterable[int],
+    participation_ratio: float = 1.0,
+    min_clients: int = 1,
+    round_idx: int = 0,
+    seed: int = 0,
+    forced_clients: Optional[Iterable[int]] = None,
+) -> List[int]:
+    """
+    Deterministically sample a client subset for a round.
+
+    When participation_ratio >= 1, this returns all eligible clients to preserve
+    the current full-participation behavior.
+    """
+    eligible = sorted(dict.fromkeys(int(idx) for idx in eligible_clients))
+    if not eligible:
+        return []
+
+    forced = sorted(
+        idx for idx in dict.fromkeys(int(idx) for idx in (forced_clients or [])) if idx in eligible
+    )
+    if participation_ratio >= 1.0:
+        return eligible
+
+    if participation_ratio < 0:
+        raise ValueError(f"participation_ratio must be >= 0, got {participation_ratio}")
+
+    requested = int(math.ceil(participation_ratio * len(eligible)))
+    requested = max(int(min_clients), requested, len(forced))
+    requested = min(len(eligible), requested)
+
+    if requested == len(eligible):
+        return eligible
+    if requested <= len(forced):
+        return forced[:requested]
+
+    remaining = [idx for idx in eligible if idx not in forced]
+    rng = random.Random(int(seed) + int(round_idx))
+    sampled = rng.sample(remaining, requested - len(forced))
+    return sorted(forced + sampled)
+
+
+def select_forced_group_clients(
+    eligible_clients: Iterable[int],
+    client_groups: Iterable[Iterable[int]],
+    round_idx: int = 0,
+    seed: int = 0,
+) -> List[int]:
+    """
+    Deterministically choose at least one client from each non-empty group.
+
+    When possible, different groups are assigned different clients; if groups
+    overlap heavily, the same client may satisfy multiple groups.
+    """
+    eligible = sorted(dict.fromkeys(int(idx) for idx in eligible_clients))
+    if not eligible:
+        return []
+
+    eligible_set = set(eligible)
+    rng = random.Random(int(seed) + int(round_idx))
+    forced: List[int] = []
+
+    for raw_group in client_groups or []:
+        group = sorted(
+            dict.fromkeys(int(idx) for idx in raw_group if int(idx) in eligible_set)
+        )
+        if not group:
+            continue
+        available = [idx for idx in group if idx not in forced]
+        pool = available or group
+        forced.append(pool[rng.randrange(len(pool))])
+
+    return sorted(dict.fromkeys(forced))
 
 
 def _should_permute(name: str, param: torch.Tensor, predicate: Optional[Callable[[str, torch.Tensor], bool]]) -> bool:

@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvg,FedAvgM}" # FedAvgM, FedAvg, FedYogi, FedProx, FedAdagrad, FedAdam
+FL_METHOD="${FL_METHOD:-FedAvg,FedAdam,FedAdagrad}" # FedAvgM, FedAvg, FedYogi, FedProx, FedAdagrad, FedAdam，FedNova
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fl-method)
@@ -33,6 +33,8 @@ echo "Visible CUDA devices: ${CUDA_VISIBLE_DEVICES}"
 
 PARALLEL_CLIENT_WORKERS="${PARALLEL_CLIENT_WORKERS:-0}"
 CLIENT_PARALLEL_DEVICES="${CLIENT_PARALLEL_DEVICES:-}"
+PARTICIPATION_RATIO="${PARTICIPATION_RATIO:-0.1}"
+MIN_PARTICIPATING_CLIENTS="${MIN_PARTICIPATING_CLIENTS:-3}"
 RETAIN_PARALLEL_ARGS=(
   ++trainer.method_args.parallel_client_workers="${PARALLEL_CLIENT_WORKERS}"
 )
@@ -42,8 +44,17 @@ if [ -n "${CLIENT_PARALLEL_DEVICES}" ]; then
   )
 fi
 
+PARTICIPATION_ARGS=(
+  ++trainer.method_args.participation_ratio="${PARTICIPATION_RATIO}"
+  ++trainer.method_args.min_participating_clients="${MIN_PARTICIPATING_CLIENTS}"
+)
+
 # 是否运行+保存所有 pre 评测，默认关闭以节省时间
 ENABLE_PRE_EVAL="${ENABLE_PRE_EVAL:-false}"
+
+# Target 客户端额外 forget 合并评测（与 source/授权客户端当轮合并集一致），见 eval_routing.ROUND_FORGET_MERGE_STAGE_SUFFIX
+# 关闭：EVAL_TARGET_ROUND_FORGET_MERGE=false
+export EVAL_TARGET_ROUND_FORGET_MERGE="${EVAL_TARGET_ROUND_FORGET_MERGE:-false}"
 
 ########################################
 MODELS=("Llama-3.2-1B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1B-Instruct-lora
@@ -51,18 +62,22 @@ MODELS=("Llama-3.2-1B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1
 FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
 RETAIN_SPLITS=("retain90")
-NUM_CLIENTS="${NUM_CLIENTS:-10}"
-NUM_SOURCE_CLIENTS="${NUM_SOURCE_CLIENTS:-3}"
-NUM_TARGETS_PER_SOURCE="${NUM_TARGETS_PER_SOURCE:-3}"
-SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-0,3,7}"      # 指定 "0,3,7"
-SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-{0:[1,2,4],3:[4,5,8],7:[3,6,8]}}"    # 指定 '{"0":[1,2,4],"3":[4,5,8],"7":[3,6,8]}'
+NUM_CLIENTS="${NUM_CLIENTS:-100}"
+# 全局 source 候选池与数据划分；每轮动态 source→target 见 eval_rounds/round_*/participation.json
+NUM_SOURCE_CLIENTS="${NUM_SOURCE_CLIENTS:-10}"
+NUM_TARGETS_PER_SOURCE="${NUM_TARGETS_PER_SOURCE:-2}"
+SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-0,10,20,30,40,50,60,70,80,90}"      # 指定 "0,3,7"
+SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-{0:[3,6],10:[13,16],20:[23,26],30:[33,36],40:[43,46],50:[53,56],60:[63,66],70:[73,76],80:[83,86],90:[93,96]}}"  ## {0:[1,2,4],3:[4,5,8],7:[3,6,8]}
+MIN_SOURCE_CLIENTS_PER_ROUND="${MIN_SOURCE_CLIENTS_PER_ROUND:-2}"
+TARGETS_PER_SOURCE_PER_ROUND="${TARGETS_PER_SOURCE_PER_ROUND:-2}"
 RETAIN_CLIENT_WEIGHTS="${RETAIN_CLIENT_WEIGHTS:-}"
 FORGET_SOURCE_WEIGHTS="${FORGET_SOURCE_WEIGHTS:-}"
 
-LEARNING_RATE="${LEARNING_RATE:-8e-5}"
+LEARNING_RATE="${LEARNING_RATE:-8e-4}"  ## 8e-5
 
-USE_CLIENT_FORGET_EVAL=true  # 是否在 forget_utility 中使用目标客户端的 forget 子集
-ASSIGN_FORGET_TO_REVOKER_ONLY=true   # 数据集划分方式
+# retain-only 默认按 source-client 拓扑分配 forget，支持大规模部分客户端参与。
+# 如需回退旧行为，可显式传 ASSIGN_FORGET_TO_REVOKER_ONLY=true。
+ASSIGN_FORGET_TO_REVOKER_ONLY="${ASSIGN_FORGET_TO_REVOKER_ONLY:-true}"   # 数据集划分方式
 if [ "${ASSIGN_FORGET_TO_REVOKER_ONLY}" = "true" ]; then
   LOG_ROOT="logs/TOFU/fedperm_only"
   OUT_ROOT="saves/TOFU/fedperm_only"
@@ -71,11 +86,8 @@ else
   OUT_ROOT="saves/TOFU/fedperm"
 fi
 
-REVOKER_CLIENT_IDX=0
-
 TOPOLOGY_ARGS=(
   ++trainer.method_args.num_clients="${NUM_CLIENTS}"
-  ++trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}"
 )
 if [ -n "${NUM_SOURCE_CLIENTS}" ]; then
   TOPOLOGY_ARGS+=(
@@ -108,6 +120,11 @@ if [ -n "${FORGET_SOURCE_WEIGHTS}" ]; then
   )
 fi
 
+ROUND_TOPOLOGY_ARGS=(
+  ++trainer.method_args.min_source_clients_per_round="${MIN_SOURCE_CLIENTS_PER_ROUND}"
+  ++trainer.method_args.targets_per_source_per_round="${TARGETS_PER_SOURCE_PER_ROUND}"
+)
+
 GLOBAL_ROUNDS=5
 SAVE_INTERVAL=0              # 0 表示每轮保存；1 表示间隔一轮保存（1,3,5...），以此类推
 
@@ -122,7 +139,7 @@ mkdir -p "${LOG_ROOT}" "${OUT_ROOT}"
 ########################################
 
 run_eval() {
-  run_eval_common "$1" "$2" "${FORGET_IDX_PATH:-}"
+  run_eval_common "$@"
 }
 
 eval_rounds() {
@@ -148,17 +165,10 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       HOLDOUT_SPLIT="${HOLDOUT_SPLITS[$idx]}"
       RETAIN_SPLIT="${RETAIN_SPLITS[$idx]}"
 
-      # 唯一的客户端划分目录，按 ASSIGN_FORGET_TO_REVOKER_ONLY 区分：fedperm / fedperm_only
+      # 共享客户端划分目录；默认按 source-client 拓扑切分 retain/forget。
       COMMON_SPLIT_DIR="${OUT_ROOT}/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
       mkdir -p "${COMMON_SPLIT_DIR}"
       export FEDPERM_SPLIT_DIR="${COMMON_SPLIT_DIR}"
-      RETAIN_IDX_FILE="${COMMON_SPLIT_DIR}/global_retain_indices.json"
-      FORGET_IDX_FILE="${COMMON_SPLIT_DIR}/global_forget_indices.json"
-      SPLITS_READY=false
-     if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
-       SPLITS_READY=true
-       echo "Found existing global indices, reuse: ${COMMON_SPLIT_DIR}"
-     fi
 
       echo ">>> SPLITS retain=${RETAIN_SPLIT} forget=${FORGET_SPLIT} holdout=${HOLDOUT_SPLIT}"
 
@@ -168,7 +178,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       RETAIN_TASK="retain_${CURRENT_FL_METHOD}_${MODEL_CFG}_${RETAIN_SPLIT}"
       RETAIN_DIR="${OUT_ROOT}/${RETAIN_TASK}"
       CLIENT_SPLIT_DIR="${COMMON_SPLIT_DIR}"
-      FORGET_IDX_PATH="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
       mkdir -p "${RETAIN_DIR}"
 
       if training_complete "${RETAIN_DIR}" "${GLOBAL_ROUNDS}"; then
@@ -176,21 +185,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       else
         EXTRA_EVAL_ARGS=()
         SAVE_SPLITS_FOR_EVAL=true
-        if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
-          EXTRA_EVAL_ARGS+=(
-            eval.tofu.forget_indices_path="${FORGET_IDX_PATH}"
-            eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
-          )
-        fi
-        # 若公共划分已存在，直接复用，不再生成新划分
-        if [ "${SPLITS_READY}" = true ]; then
-          SAVE_SPLITS_FOR_EVAL=false
-          EXTRA_EVAL_ARGS+=(
-            +trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}"
-            +trainer.method_args.forget_indices_path="${FORGET_IDX_FILE}"
-            trainer.method_args.save_client_splits_for_eval=false
-          )
-        fi
         # 计算本阶段跳过的评测轮次（传递给 Trainer）
         SKIP_ROUNDS=$(compute_skip_rounds "${GLOBAL_ROUNDS}" "${SAVE_INTERVAL}")
         FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
@@ -212,7 +206,9 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.method_args.global_rounds="${GLOBAL_ROUNDS}" \
           trainer.method_args.save_client_splits_for_eval="${SAVE_SPLITS_FOR_EVAL}" \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
+          "${PARTICIPATION_ARGS[@]}" \
           "${TOPOLOGY_ARGS[@]}" \
+          "${ROUND_TOPOLOGY_ARGS[@]}" \
           "${RETAIN_PARALLEL_ARGS[@]}" \
           trainer.args.output_dir="${RETAIN_DIR}" \
           trainer.args.save_strategy="epoch" \
@@ -221,14 +217,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.args.learning_rate="${LEARNING_RATE}" \
           "${EXTRA_EVAL_ARGS[@]}" \
           2>&1 | tee "${LOG_ROOT}/${RETAIN_TASK}.txt"
-        if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
-          SPLITS_READY=true
-        fi
-      fi
-
-      if [ "${SPLITS_READY}" != true ]; then
-        echo "缺少公共划分文件：${COMMON_SPLIT_DIR}，请确保已生成全局索引后再继续。" >&2
-        exit 1
       fi
 
       # 根据保存频次裁剪 checkpoint

@@ -23,18 +23,23 @@ compute_skip_rounds() {
   echo "${skip%,}"
 }
 
-resolve_forget_sources_common() {
-  local split_dir="${1:-${COMMON_SPLIT_DIR:-}}"
+resolve_round_forget_sources_common() {
+  local round_dir="$1"
+  local split_dir="${2:-${COMMON_SPLIT_DIR:-}}"
   SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-}" \
-  REVOKER_CLIENT_IDX="${REVOKER_CLIENT_IDX:-}" \
-  python3 - "$split_dir" <<'PY'
+  SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-}" \
+  python3 - "$round_dir" "$split_dir" <<'PY'
 import json
 import os
 import sys
 
-split_dir = sys.argv[1] if len(sys.argv) > 1 else ""
+round_dir = sys.argv[1] if len(sys.argv) > 1 else ""
+split_dir = sys.argv[2] if len(sys.argv) > 2 else ""
+participation_path = os.path.join(round_dir, "participation.json") if round_dir else ""
+
 topology = None
 env_mapping = os.environ.get("SOURCE_TO_TARGETS", "").strip()
+raw_sources = os.environ.get("SOURCE_CLIENT_INDICES", "").strip()
 if env_mapping:
     try:
         topology = json.loads(env_mapping)
@@ -48,34 +53,66 @@ if topology is None and split_dir:
             payload = json.load(f)
         topology = payload.get("source_to_targets")
 
-sources = set()
+source_clients = set()
+if raw_sources:
+    for value in raw_sources.split(","):
+        value = value.strip()
+        if value:
+            source_clients.add(int(value))
 if topology:
     for key in topology.keys():
-        sources.add(int(key))
+        source_clients.add(int(key))
 
-if not sources:
-    fallback = os.environ.get("REVOKER_CLIENT_IDX", "").strip()
-    if fallback:
-        sources.add(int(fallback))
+if not os.path.isfile(participation_path):
+    raise SystemExit(f"Missing participation metadata: {participation_path}")
 
-print(",".join(str(v) for v in sorted(sources)))
+with open(participation_path, "r") as f:
+    participation = json.load(f)
+selected_clients = {int(idx) for idx in participation.get("selected_clients", [])}
+# 新：Trainer 每轮写入的 source_clients（动态拓扑），优先于静态 SOURCE_* / fedperm_topology.json
+round_sources = participation.get("source_clients")
+if round_sources:
+    active_sources = [int(idx) for idx in round_sources if int(idx) in selected_clients]
+    print(",".join(str(v) for v in active_sources))
+    raise SystemExit(0)
+active_sources = sorted(idx for idx in source_clients if idx in selected_clients)
+print(",".join(str(v) for v in active_sources))
 PY
+}
+
+build_eval_summary_paths_common() {
+  local root_dir="$1"
+  local stage_name="$2"
+  local forget_sources_csv="${3:-}"
+
+  if [ -z "${forget_sources_csv}" ]; then
+    printf '%s\n' "${root_dir}/${stage_name}/TOFU_SUMMARY.json"
+    return
+  fi
+
+  local source_idx
+  IFS=',' read -ra source_list <<< "${forget_sources_csv}"
+  for source_idx in "${source_list[@]}"; do
+    [ -z "${source_idx}" ] && continue
+    printf '%s/%s__forget_src_%s/TOFU_SUMMARY.json\n' "${root_dir}" "${stage_name}" "${source_idx}"
+  done
 }
 
 resolve_eval_forget_indices_common() {
   local split_dir="$1"
   local stage="$2"
   local forget_source_idx="${3:-}"
+  local active_sources_csv="${4:-}"
   SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-}" \
   SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-}" \
-  python3 - "$split_dir" "$stage" "$forget_source_idx" <<'PY'
+  python3 - "$split_dir" "$stage" "$forget_source_idx" "$active_sources_csv" <<'PY'
 import json
 import os
 import sys
 
 from trainer.federated.eval_routing import resolve_forget_indices_path
 
-split_dir, stage, forget_source_idx = sys.argv[1], sys.argv[2], sys.argv[3]
+split_dir, stage, forget_source_idx, active_sources_csv = sys.argv[1:5]
 raw_mapping = os.environ.get("SOURCE_TO_TARGETS", "").strip()
 raw_sources = os.environ.get("SOURCE_CLIENT_INDICES", "").strip()
 
@@ -93,12 +130,17 @@ source_client_indices = []
 if raw_sources:
     source_client_indices = [int(part) for part in raw_sources.split(",") if part.strip()]
 
+active_source_client_indices = [
+    int(part) for part in active_sources_csv.split(",") if part.strip()
+]
+
 resolved = resolve_forget_indices_path(
     split_dir=split_dir,
     stage=stage,
     source_to_targets=source_to_targets,
     source_client_indices=source_client_indices,
     forget_source_idx=int(forget_source_idx) if forget_source_idx else None,
+    active_source_client_indices=active_source_client_indices,
 )
 print(resolved or "")
 PY
@@ -158,12 +200,16 @@ eval_rounds_common() {
   LAST_ROUND=${total_rounds}
   for ((r=1; r<=total_rounds; r++)); do
     CURRENT_ROUND=${r}
+    local round_dir="${base_dir}/eval_rounds/round_${r}"
+    local forget_sources_csv
+    forget_sources_csv="$(resolve_round_forget_sources_common "${round_dir}" "${COMMON_SPLIT_DIR:-}")"
     local post="${base_dir}/round_${r}"
     if [ -d "${post}" ]; then
-      local post_summary_paths=(
-        "${post}/eval/${prefix}_round${r}_post_agg/TOFU_SUMMARY.json"
-        "${base_dir}/eval_rounds/round_${r}/server_post_agg/TOFU_SUMMARY.json"
+      mapfile -t post_summary_paths < <(
+        build_eval_summary_paths_common "${post}/eval" "${prefix}_round${r}_post_agg" "${forget_sources_csv}"
+        build_eval_summary_paths_common "${base_dir}/eval_rounds/round_${r}" "server_post_agg" "${forget_sources_csv}"
       )
+      FEDPERM_ACTIVE_FORGET_SOURCES="${forget_sources_csv}" \
       maybe_run_eval "${post}" "${prefix}_round${r}_post_agg" \
         "${LOG_ROOT}/${prefix}_round${r}_post_agg.txt" \
         "${post_summary_paths[@]}"
@@ -181,10 +227,11 @@ eval_rounds_common() {
       fi
       local pre="${base_dir}/round_${pre_round}"
       if [ -d "${pre}" ]; then
-        local pre_summary_paths=(
-          "${pre}/eval/${prefix}_round${r}_pre_agg/TOFU_SUMMARY.json"
-          "${base_dir}/eval_rounds/round_${r}/server_pre_agg/TOFU_SUMMARY.json"
+        mapfile -t pre_summary_paths < <(
+          build_eval_summary_paths_common "${pre}/eval" "${prefix}_round${r}_pre_agg" "${forget_sources_csv}"
+          build_eval_summary_paths_common "${base_dir}/eval_rounds/round_${r}" "server_pre_agg" "${forget_sources_csv}"
         )
+        FEDPERM_ACTIVE_FORGET_SOURCES="${forget_sources_csv}" \
         maybe_run_eval "${pre}" "${prefix}_round${r}_pre_agg" \
           "${LOG_ROOT}/${prefix}_round${r}_pre_agg.txt" \
           "${pre_summary_paths[@]}"
@@ -232,43 +279,65 @@ run_eval_common() {
   local ckpt_dir="$1"
   local stage="$2"
   local forget_idx_override="${3:-}"
-  local out_dir="${ckpt_dir}/eval/${stage}"
-  local extra_args=()
-  # 可选：强制切换 eval 组（例如 muse）
-  if [ -n "${EVAL_GROUP:-}" ]; then
-    extra_args+=(eval="${EVAL_GROUP}")
-  fi
-  local inferred_forget_src=""
-  if [[ "${stage}" =~ __forget_src_([0-9]+)$ ]]; then
-    inferred_forget_src="${BASH_REMATCH[1]}"
+  local eval_stages=("${stage}")
+  if [ "${USE_CLIENT_FORGET_EVAL:-false}" = "true" ] && [[ ! "${stage}" =~ __forget_src_ ]]; then
+    local forget_sources_csv="${FEDPERM_ACTIVE_FORGET_SOURCES:-}"
+    if [ -n "${forget_sources_csv}" ]; then
+      eval_stages=()
+      local source_idx
+      IFS=',' read -ra source_list <<< "${forget_sources_csv}"
+      for source_idx in "${source_list[@]}"; do
+        [ -z "${source_idx}" ] && continue
+        eval_stages+=("${stage}__forget_src_${source_idx}")
+      done
+    fi
   fi
 
-  if [ "${USE_CLIENT_FORGET_EVAL:-false}" = "true" ]; then
-    local forget_idx_path="${forget_idx_override}"
-    if [ -n "${COMMON_SPLIT_DIR:-}" ]; then
-      if [ -n "${inferred_forget_src}" ]; then
-        forget_idx_path="$(resolve_eval_forget_indices_common "${COMMON_SPLIT_DIR}" "${stage}" "${inferred_forget_src}")"
-      elif [ -z "${forget_idx_path}" ]; then
-        forget_idx_path="$(resolve_eval_forget_indices_common "${COMMON_SPLIT_DIR}" "${stage}")"
+  local eval_stage
+  for eval_stage in "${eval_stages[@]}"; do
+    local out_dir="${ckpt_dir}/eval/${eval_stage}"
+    local extra_args=()
+    if [ -n "${EVAL_GROUP:-}" ]; then
+      extra_args+=(eval="${EVAL_GROUP}")
+    fi
+    local inferred_forget_src=""
+    if [[ "${eval_stage}" =~ __forget_src_([0-9]+)$ ]]; then
+      inferred_forget_src="${BASH_REMATCH[1]}"
+    fi
+
+    if [ "${USE_CLIENT_FORGET_EVAL:-false}" = "true" ]; then
+      local forget_idx_path="${forget_idx_override}"
+      local active_forget_sources="${FEDPERM_ACTIVE_FORGET_SOURCES:-}"
+      if [ -n "${COMMON_SPLIT_DIR:-}" ]; then
+        if [ -n "${inferred_forget_src}" ]; then
+          forget_idx_path="$(resolve_eval_forget_indices_common "${COMMON_SPLIT_DIR}" "${eval_stage}" "${inferred_forget_src}" "${active_forget_sources}")"
+        elif [ -z "${forget_idx_path}" ]; then
+          forget_idx_path="$(resolve_eval_forget_indices_common "${COMMON_SPLIT_DIR}" "${eval_stage}" "" "${active_forget_sources}")"
+        fi
+      fi
+      if [ -z "${forget_idx_path}" ] || [ ! -f "${forget_idx_path}" ]; then
+        echo "Skip eval ${eval_stage}: no active forget indices resolved"
+        continue
+      fi
+      if [ -n "${forget_idx_path}" ] && [ -f "${forget_idx_path}" ]; then
+        extra_args+=(
+          ++eval.tofu.forget_indices_path="${forget_idx_path}"
+          ++eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
+        )
       fi
     fi
-    if [ -n "${forget_idx_path}" ] && [ -f "${forget_idx_path}" ]; then
-      extra_args+=(
-        ++eval.tofu.forget_indices_path="${forget_idx_path}"
-        ++eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
-      )
-    fi
-  fi
-  mkdir -p "${out_dir}"
-  python src/eval.py \
-    experiment="${CONFIG_EVAL}" \
-    forget_split="${FORGET_SPLIT}" \
-    holdout_split="${HOLDOUT_SPLIT}" \
-    task_name="${stage}" \
-    model.model_args.pretrained_model_name_or_path="${ckpt_dir}" \
-    paths.output_dir="${out_dir}" \
-    hydra.run.dir="${out_dir}" \
-    "${extra_args[@]}"
+
+    mkdir -p "${out_dir}"
+    python src/eval.py \
+      experiment="${CONFIG_EVAL}" \
+      forget_split="${FORGET_SPLIT}" \
+      holdout_split="${HOLDOUT_SPLIT}" \
+      task_name="${eval_stage}" \
+      model.model_args.pretrained_model_name_or_path="${ckpt_dir}" \
+      paths.output_dir="${out_dir}" \
+      hydra.run.dir="${out_dir}" \
+      "${extra_args[@]}"
+  done
 }
 
 # Client split sync (full script variant: baseline may be empty, current must exist).

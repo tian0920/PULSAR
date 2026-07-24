@@ -1,9 +1,11 @@
 import torch
 import logging
+import json
 import shutil
 from copy import deepcopy
 from typing import Dict, List, Any, Optional
 import os
+import random
 from trainer.base import FinetuneTrainer
 from trainer.unlearn.base import UnlearnTrainer
 from data.unlearn import ForgetRetainDataset
@@ -11,6 +13,12 @@ from torch.utils.data import Dataset
 from trainer.federated.federated_utils import *
 from peft import PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
 from transformers.trainer_utils import IntervalStrategy, SaveStrategy
+from trainer.federated.eval_routing import (
+    ROUND_FORGET_MERGE_STAGE_SUFFIX,
+    build_eval_variants,
+    resolve_forget_indices_path,
+    should_run_target_round_forget_merge_eval,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -60,11 +68,50 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         self.unlearn_trainer_cls = unlearn_trainer_cls
         self.aggregation_strategy = aggregation_strategy
         self.global_rounds = global_rounds
-        self.unlearn_epochs = unlearn_epochs  
+        self.unlearn_epochs = unlearn_epochs
         self.client_models = []
-        self.client_data_sizes = [] 
+        self.client_data_sizes = []
+        self.selected_clients = set()
         self.kwargs = kwargs
-        self.revoker_client_idx = kwargs.get("revoker_client_idx", 0)
+        self.source_to_targets = self._resolve_source_to_targets(
+            kwargs.get("source_to_targets", None)
+        )
+        self.source_client_indices = sorted(self.source_to_targets.keys())
+        self.target_client_indices = sorted(
+            {
+                int(target_idx)
+                for target_indices in self.source_to_targets.values()
+                for target_idx in (target_indices or [])
+            }
+        )
+        explicit_source_clients = kwargs.get("source_client_indices", None)
+        if explicit_source_clients:
+            explicit_source_clients = sorted(
+                dict.fromkeys(int(idx) for idx in explicit_source_clients)
+            )
+            for src_idx in explicit_source_clients:
+                self.source_to_targets.setdefault(src_idx, [])
+            self.source_client_indices = sorted(self.source_to_targets.keys())
+        if not self.source_client_indices:
+            self.source_client_indices = [int(self.target_client_idx)]
+        self.participation_ratio = float(kwargs.get("participation_ratio", 1.0))
+        self.min_participating_clients = int(kwargs.get("min_participating_clients", 1))
+        participation_seed = kwargs.get("participation_seed", None)
+        if participation_seed is None:
+            participation_seed = getattr(self.args, "seed", 0)
+        self.participation_seed = int(participation_seed)
+        self.min_source_clients_per_round = int(kwargs.get("min_source_clients_per_round", 2))
+        self.targets_per_source_per_round = int(kwargs.get("targets_per_source_per_round", 2))
+        self.round_topology_seed = int(kwargs.get("round_topology_seed", self.participation_seed))
+        self.current_round_source_to_targets: Dict[int, List[int]] = {}
+        self.current_round_source_clients: List[int] = []
+        _etm = kwargs.get("eval_target_round_forget_merge", None)
+        if _etm is None:
+            self.eval_target_round_forget_merge = os.environ.get(
+                "EVAL_TARGET_ROUND_FORGET_MERGE", ""
+            ).lower() in ("1", "true", "yes", "on")
+        else:
+            self.eval_target_round_forget_merge = bool(_etm)
         self.enable_pre_eval = os.environ.get("ENABLE_PRE_EVAL", "false").lower() in (
             "1",
             "true",
@@ -117,6 +164,230 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         
         logger.info(f"Initialized with {num_clients} clients, target: {target_client_idx}, global rounds: {global_rounds}")
         logger.info(f"Model type - PEFT: {self.is_peft}")
+        logger.info(f"Source clients for eval: {self.source_client_indices}")
+        logger.info(f"Source to targets mapping: {self.source_to_targets}")
+        logger.info(
+            "Client participation ratio: %s, min clients: %s, seed: %s",
+            self.participation_ratio,
+            self.min_participating_clients,
+            self.participation_seed,
+        )
+
+    def _load_topology_metadata(self):
+        split_dir = os.environ.get(
+            "FEDPERM_SPLIT_DIR", os.path.join(self.args.output_dir, "client_splits")
+        )
+        topology_path = os.path.join(split_dir, "fedperm_topology.json")
+        if not os.path.isfile(topology_path):
+            return None
+        try:
+            with open(topology_path, "r") as f:
+                return json.load(f)
+        except Exception as exc:
+            logger.warning(f"Failed to load topology metadata from {topology_path}: {exc}")
+            return None
+
+    def _resolve_source_to_targets(self, source_to_targets):
+        topology = source_to_targets
+        if topology is None:
+            metadata = self._load_topology_metadata()
+            if metadata:
+                topology = metadata.get("source_to_targets", None)
+        if topology is None:
+            return {}
+
+        normalized = {}
+        for raw_src, raw_targets in topology.items():
+            src_idx = int(raw_src)
+            if src_idx < 0 or src_idx >= self.num_clients:
+                raise ValueError(
+                    f"Source client index {src_idx} out of range for num_clients={self.num_clients}"
+                )
+            target_indices = []
+            for raw_tgt in raw_targets or []:
+                tgt_idx = int(raw_tgt)
+                if tgt_idx < 0 or tgt_idx >= self.num_clients:
+                    raise ValueError(
+                        f"Target client index {tgt_idx} out of range for num_clients={self.num_clients}"
+                    )
+                if tgt_idx == src_idx:
+                    raise ValueError(
+                        f"Source client {src_idx} cannot target itself in source_to_targets"
+                    )
+                target_indices.append(tgt_idx)
+            normalized[src_idx] = sorted(dict.fromkeys(target_indices))
+        return normalized
+
+    def _eligible_clients(self) -> List[int]:
+        return [
+            client_idx for client_idx in range(self.num_clients) if client_idx in self.federated_dataset
+        ]
+
+    def _required_participating_clients(self, round_idx: int) -> List[int]:
+        eligible_clients = self._eligible_clients()
+        eligible_set = set(eligible_clients)
+        source_candidates = [
+            idx for idx in self.source_client_indices if idx in eligible_set
+        ]
+        target_candidates = [
+            idx for idx in self.target_client_indices if idx in eligible_set
+        ]
+        if self.source_client_indices and not source_candidates:
+            raise ValueError("No eligible source clients available for participation sampling")
+        if self.target_client_indices and not target_candidates:
+            raise ValueError("No eligible target clients available for participation sampling")
+        if source_candidates:
+            rng = random.Random(self.participation_seed + round_idx)
+            required_sources = min(
+                len(source_candidates),
+                max(1, self.min_source_clients_per_round),
+            )
+            forced_source_clients = sorted(rng.sample(source_candidates, required_sources))
+        else:
+            forced_source_clients = []
+        return sorted(
+            dict.fromkeys(
+                forced_source_clients
+                + select_forced_group_clients(
+                    eligible_clients=self._eligible_clients(),
+                    client_groups=[source_candidates, target_candidates],
+                    round_idx=round_idx,
+                    seed=self.participation_seed,
+                )
+            )
+        )
+
+    def _active_source_to_targets(self) -> Dict[int, List[int]]:
+        return self.current_round_source_to_targets or self.source_to_targets
+
+    def _round_topology_cache_path(self) -> str:
+        split_dir = os.environ.get(
+            "FEDPERM_SPLIT_DIR", os.path.join(self.args.output_dir, "client_splits")
+        )
+        os.makedirs(split_dir, exist_ok=True)
+        return os.path.join(split_dir, "fedperm_round_topology.json")
+
+    def _load_round_topology(self, round_idx: int) -> Optional[Dict[str, Any]]:
+        cache_path = self._round_topology_cache_path()
+        if not os.path.isfile(cache_path):
+            return None
+        try:
+            with open(cache_path, "r") as f:
+                payload = json.load(f)
+            rounds = payload.get("rounds", {})
+            entry = rounds.get(str(round_idx + 1))
+            if not entry:
+                return None
+            return {
+                "source_clients": [int(idx) for idx in entry.get("source_clients", [])],
+                "source_to_targets": {
+                    int(src): [int(tgt) for tgt in tgts]
+                    for src, tgts in (entry.get("source_to_targets", {}) or {}).items()
+                },
+            }
+        except Exception as exc:
+            logger.warning("Failed to load round topology cache: %s", exc)
+            return None
+
+    def _save_round_topology(self, round_idx: int):
+        cache_path = self._round_topology_cache_path()
+        payload = {"rounds": {}}
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path, "r") as f:
+                    payload = json.load(f)
+            except Exception:
+                payload = {"rounds": {}}
+        payload.setdefault("rounds", {})
+        payload["rounds"][str(round_idx + 1)] = {
+            "source_clients": [int(idx) for idx in self.current_round_source_clients],
+            "source_to_targets": {
+                str(src): [int(tgt) for tgt in tgts]
+                for src, tgts in self.current_round_source_to_targets.items()
+            },
+            "seed": int(self.round_topology_seed),
+        }
+        with open(cache_path, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    def _assign_round_source_targets(self, round_idx: int):
+        cached = self._load_round_topology(round_idx)
+        if cached:
+            self.current_round_source_clients = cached["source_clients"]
+            self.current_round_source_to_targets = cached["source_to_targets"]
+            return
+        selected = sorted(int(idx) for idx in self.selected_clients)
+        selected_set = set(selected)
+        source_pool = [idx for idx in self.source_client_indices if idx in selected_set]
+        if len(source_pool) < self.min_source_clients_per_round:
+            source_pool = selected
+        required_sources = min(len(source_pool), max(1, self.min_source_clients_per_round))
+        rng = random.Random(self.round_topology_seed + round_idx)
+        round_sources = sorted(rng.sample(source_pool, required_sources)) if required_sources > 0 else []
+        candidate_targets = [idx for idx in selected if idx not in round_sources]
+        mapping: Dict[int, List[int]] = {}
+        for offset, src_idx in enumerate(round_sources):
+            if not candidate_targets:
+                mapping[src_idx] = []
+                continue
+            local_rng = random.Random(self.round_topology_seed + round_idx * 9973 + offset + 1)
+            sample_n = min(len(candidate_targets), max(1, self.targets_per_source_per_round))
+            mapping[src_idx] = sorted(local_rng.sample(candidate_targets, sample_n))
+        self.current_round_source_clients = round_sources
+        self.current_round_source_to_targets = mapping
+        self._save_round_topology(round_idx)
+
+    def _select_participating_clients(self, round_idx: int) -> List[int]:
+        required_clients = self._required_participating_clients(round_idx)
+        selected = sample_participating_clients(
+            eligible_clients=self._eligible_clients(),
+            participation_ratio=self.participation_ratio,
+            min_clients=self.min_participating_clients,
+            round_idx=round_idx,
+            seed=self.participation_seed,
+            forced_clients=required_clients,
+        )
+        logger.info(
+            "Round %s selected clients for retain training: %s%s",
+            round_idx + 1,
+            selected,
+            f" (forced={required_clients})" if required_clients else "",
+        )
+        return selected
+
+    def _save_participation_metadata(
+        self,
+        round_idx: int,
+        selected_clients: List[int],
+        forced_clients: Optional[List[int]] = None,
+    ):
+        round_dir = os.path.join(
+            self.args.output_dir,
+            "eval_rounds",
+            f"round_{round_idx + 1}",
+        )
+        os.makedirs(round_dir, exist_ok=True)
+        payload = {
+            "round": round_idx + 1,
+            "selected_clients": [int(idx) for idx in selected_clients],
+            "forced_clients": [int(idx) for idx in (forced_clients or [])],
+            "source_clients": [int(idx) for idx in self.current_round_source_clients],
+            "source_to_targets": {
+                str(src): [int(tgt) for tgt in tgts]
+                for src, tgts in self.current_round_source_to_targets.items()
+            },
+            "participation_ratio": self.participation_ratio,
+            "min_participating_clients": self.min_participating_clients,
+        }
+        with open(os.path.join(round_dir, "participation.json"), "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    def _forget_eval_sources(self) -> List[int]:
+        if self.current_round_source_clients:
+            return list(self.current_round_source_clients)
+        return sorted(
+            idx for idx in self.source_client_indices if idx in self.selected_clients
+        )
 
 
     def train(self, resume_from_checkpoint=None, trial=None, **kwargs):
@@ -140,44 +411,42 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         
         for round_idx in range(self.global_rounds):
             logger.info(f"Starting global round {round_idx + 1}/{self.global_rounds}")
-            logger.info(
-                "Step 1: Unlearning on revoker client %s with current global model",
-                self.revoker_client_idx,
+            logger.info("Step 1: Unlearning on source clients %s with current global model", self.source_client_indices)
+            selected_clients = self._select_participating_clients(round_idx)
+            self.selected_clients = set(selected_clients)
+            self._assign_round_source_targets(round_idx)
+            self._save_participation_metadata(
+                round_idx,
+                selected_clients,
+                forced_clients=self._required_participating_clients(round_idx),
             )
-            unlearn_trainer = None
-            if self.revoker_client_idx in self.federated_dataset:
-                revoker_dataset = self.federated_dataset[self.revoker_client_idx]
+            unlearn_source_clients = self._source_clients_for_unlearning()
+            unlearn_state_dicts = []
+            unlearn_weights = []
+            if not unlearn_source_clients:
+                logger.warning("No source client with forget data available, skipping source unlearning")
+            for source_client_idx in unlearn_source_clients:
+                source_dataset = self.federated_dataset[source_client_idx]
+                forget_data = self._resolve_forget_data(source_dataset.forget)
+                if forget_data is None or len(forget_data) == 0:
+                    logger.warning(
+                        "Source client %s has no forget data, skipping unlearning",
+                        source_client_idx,
+                    )
+                    continue
+                logger.info("Running unlearning on source client %s", source_client_idx)
                 unlearn_model = deepcopy(self.model)
-                unlearn_trainer = self.unlearn_client_model(unlearn_model, revoker_dataset)
-                logger.info("Completed unlearning on revoker client")
-                self._apply_theta_unlearn_state_to_global()
-                if round_idx == 0:
-                    pre_retain_target_path = (
-                        f"{self.args.output_dir}/pre_retain_target_client_{self.revoker_client_idx}"
-                    )
-                    os.makedirs(pre_retain_target_path, exist_ok=True)
-                    tgt_model = unlearn_trainer.model.cpu()
-                    if self.is_peft:
-                        tgt_model.save_pretrained(pre_retain_target_path, safe_serialization=False)
-                        if self.tokenizer is not None:
-                            self.tokenizer.save_pretrained(pre_retain_target_path, safe_serialization=False)
-                    else:
-                        torch.save(
-                            tgt_model.state_dict(),
-                            os.path.join(pre_retain_target_path, "pytorch_model.bin"),
-                        )
-                        if self.tokenizer is not None:
-                            self.tokenizer.save_pretrained(pre_retain_target_path, safe_serialization=False)
-                    logger.info(
-                        "Saved pre-retain revoker client %s model at %s",
-                        self.revoker_client_idx,
-                        pre_retain_target_path,
-                    )
-            else:
-                logger.warning(
-                    "Revoker client %s has no data, skipping unlearning",
-                    self.revoker_client_idx,
+                unlearn_trainer = self.unlearn_client_model(unlearn_model, source_dataset)
+                logger.info("Completed unlearning on source client %s", source_client_idx)
+                unlearn_state_dicts.append(self._extract_model_state(unlearn_trainer.model))
+                unlearn_weights.append(len(forget_data))
+
+            if unlearn_state_dicts:
+                self.theta_unlearn_state = self._aggregate_unlearn_states(
+                    unlearn_state_dicts,
+                    unlearn_weights,
                 )
+                self._apply_theta_unlearn_state_to_global()
 
             logger.info("Step 2: All clients training on retain data with updated global model")
 
@@ -190,13 +459,8 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 )
             
          
-            self.client_models = [deepcopy(self.model) for _ in range(self.num_clients)]
-            if self.init_all_clients_from_unlearn:
-                for idx, client_model in enumerate(self.client_models):
-                    self._apply_theta_unlearn_state_to_model(
-                        client_model, scope=f"client{idx}"
-                    )
-            self.client_data_sizes = [] 
+            self.client_models = [None] * self.num_clients
+            self.client_data_sizes = [0] * self.num_clients
 
            
             logger.info(f"Aggregation strategy: {self.aggregation_strategy}")
@@ -205,15 +469,22 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             for client_idx in range(self.num_clients):
                 if client_idx not in self.federated_dataset:
                     logger.warning(f"Skipping client {client_idx} as no data is available")
-                    self.client_data_sizes.append(0)
+                    continue
+                if client_idx not in self.selected_clients:
+                    logger.info(f"Skipping client {client_idx} this round due to participation sampling")
                     continue
                     
-                client_model = self.client_models[client_idx]
+                client_model = deepcopy(self.model).cpu()
+                if self.init_all_clients_from_unlearn:
+                    self._apply_theta_unlearn_state_to_model(
+                        client_model, scope=f"client{client_idx}"
+                    )
+                self.client_models[client_idx] = client_model
                 client_dataset = self.federated_dataset[client_idx]
                 
                 retain_data = self._resolve_retain_data(client_dataset.retain)
                 client_data_size = len(retain_data)
-                self.client_data_sizes.append(client_data_size)
+                self.client_data_sizes[client_idx] = client_data_size
                 
                 logger.info(f"Training client {client_idx} on retain data with {self.args.num_train_epochs} epochs")
                 if self.enable_pre_eval:
@@ -232,7 +503,7 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 
                 self.client_models[client_idx] = client_model.cpu()
 
-            for client_idx in range(self.num_clients):
+            for client_idx in selected_clients:
                 trained_client_model = (
                     self.client_models[client_idx]
                     if client_idx < len(self.client_models)
@@ -245,6 +516,17 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                     round_idx=round_idx,
                     stage=f"client{client_idx}_post_train",
                 )
+                if should_run_target_round_forget_merge_eval(
+                    self.eval_target_round_forget_merge,
+                    client_idx,
+                    self._forget_eval_sources(),
+                    self._active_source_to_targets(),
+                ):
+                    self._maybe_evaluate_model(
+                        model=trained_client_model,
+                        round_idx=round_idx,
+                        stage=f"client{client_idx}_post_train{ROUND_FORGET_MERGE_STAGE_SUFFIX}",
+                    )
 
             logger.info("Step 3: Aggregating all client models")
             self.aggregate_models(round_idx)
@@ -273,6 +555,49 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         if hasattr(retain_dataset, "retain") and getattr(retain_dataset, "retain") is not None:
             return retain_dataset.retain
         return retain_dataset
+
+    @staticmethod
+    def _resolve_forget_data(forget_dataset):
+        """Return underlying forget split when present; fallback to the dataset itself."""
+        if forget_dataset is None:
+            return None
+        if hasattr(forget_dataset, "forget") and getattr(forget_dataset, "forget") is not None:
+            return forget_dataset.forget
+        return forget_dataset
+
+    def _source_clients_for_unlearning(self) -> List[int]:
+        if self.current_round_source_clients:
+            return [
+                client_idx
+                for client_idx in self.current_round_source_clients
+                if client_idx in self.federated_dataset
+            ]
+        return [
+            client_idx
+            for client_idx in self.source_client_indices
+            if client_idx in self.federated_dataset and client_idx in self.selected_clients
+        ]
+
+    def _extract_model_state(self, model):
+        if self.is_peft:
+            state = get_peft_model_state_dict(model)
+        else:
+            state = model.state_dict()
+        return {
+            key: value.detach().clone().cpu() if isinstance(value, torch.Tensor) else value
+            for key, value in state.items()
+        }
+
+    def _aggregate_unlearn_states(self, state_dicts, weights):
+        if not state_dicts:
+            return None
+        if len(state_dicts) == 1:
+            return state_dicts[0]
+        return FedAvg(
+            state_dicts,
+            global_model_state_dict=state_dicts[0],
+            client_weights=weights,
+        )
 
     def _apply_theta_unlearn_state_to_global(self):
         """Initialize global model from theta_unlearn_state when available."""
@@ -321,82 +646,7 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
                 f"Skipping pre eval for stage {stage} due to ENABLE_PRE_EVAL={self.enable_pre_eval}"
             )
             return
-        # Align with FederatedPermTrainer: dynamic eval indices by stage.
-        try:
-            import re
-
-            split_dir = os.environ.get(
-                "FEDPERM_SPLIT_DIR", os.path.join(self.args.output_dir, "client_splits")
-            )
-            forget_idx_path = os.path.join(
-                split_dir, f"client{self.revoker_client_idx}_forget_indices.json"
-            )
-            retain_idx_path = None
-            m = re.match(r"client(\d+)_", stage)
-            if stage.startswith("server"):
-                retain_idx_path = os.path.join(split_dir, "global_retain_indices.json")
-            elif m:
-                cidx = int(m.group(1))
-                retain_idx_path = os.path.join(split_dir, f"client{cidx}_retain_indices.json")
-
-            if hasattr(self.evaluator, "eval_cfg"):
-                if hasattr(self.evaluator.eval_cfg, "tofu"):
-                    eval_tofu = self.evaluator.eval_cfg.tofu
-                    if not os.path.exists(forget_idx_path):
-                        logger.error(
-                            f"Forget indices missing for stage {stage}: {forget_idx_path}. "
-                            "Abort eval to avoid falling back to full dataset."
-                        )
-                        return
-                    eval_tofu.forget_indices_path = forget_idx_path
-                    if retain_idx_path:
-                        if not os.path.exists(retain_idx_path):
-                            logger.error(
-                                f"Retain indices missing for stage {stage}: {retain_idx_path}. "
-                                "Abort eval to avoid falling back to full dataset."
-                            )
-                            return
-                        eval_tofu.retain_indices_path = retain_idx_path
-                    self._update_eval_dataset_indices(eval_tofu)
-
-                if hasattr(self.evaluator.eval_cfg, "muse"):
-                    eval_muse = self.evaluator.eval_cfg.muse
-                    if not os.path.exists(forget_idx_path):
-                        logger.error(
-                            f"MUSE forget indices missing for stage {stage}: {forget_idx_path}. "
-                            "Abort eval to avoid falling back to full dataset."
-                        )
-                        return
-                    eval_muse.forget_indices_path = forget_idx_path
-                    self._update_eval_dataset_indices(eval_muse)
-
-                # Clear cached datasets so index changes take effect.
-                if hasattr(self.evaluator, "metrics"):
-                    for metric in self.evaluator.metrics.values():
-                        if hasattr(metric, "data"):
-                            metric.data = None
-                        if hasattr(metric, "collators"):
-                            metric.collators = None
-        except Exception as exc:
-            logger.warning(f"Failed to set eval indices dynamically: {exc}")
-        eval_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx + 1}",
-            stage,
-        )
-        os.makedirs(eval_dir, exist_ok=True)
-
-        summary_file = os.path.join(eval_dir, "TOFU_SUMMARY.json")
-        summary_exists = os.path.isfile(summary_file) and os.path.getsize(summary_file) > 0
-
         force_eval = os.environ.get("FORCE_FEDPERM_EVAL", "0") in ("1", "true", "True")
-        if summary_exists and not force_eval:
-            logger.info(
-                f"Skipping eval for stage {stage} at round {round_idx + 1}, existing summary: {summary_file}"
-            )
-            return
-
         model_was_on_cpu = next(model.parameters()).device.type == "cpu"
         if torch.cuda.is_available() and model_was_on_cpu:
             device = torch.device("cuda")
@@ -408,15 +658,111 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             overwrite = getattr(self.evaluator.eval_cfg, "overwrite", True)
 
         try:
-            self.evaluator.evaluate(
-                model=model,
-                tokenizer=self.tokenizer,
-                template_args=self.template_args,
-                output_dir=eval_dir,
-                overwrite=overwrite,
-            )
-        except Exception as exc:
-            logger.warning(f"Evaluation failed at {stage} (round {round_idx}): {exc}")
+            forget_sources = self._forget_eval_sources()
+            if self.source_client_indices and not forget_sources:
+                logger.info(
+                    "No sampled source clients selected at round %s; skip eval for stage %s",
+                    round_idx + 1,
+                    stage,
+                )
+                return
+            active_map = self._active_source_to_targets()
+            for eval_stage, forget_source_idx in build_eval_variants(
+                stage,
+                forget_sources,
+                source_to_targets=active_map,
+                source_client_indices=sorted(active_map.keys()),
+            ):
+                try:
+                    import re
+
+                    split_dir = os.environ.get(
+                        "FEDPERM_SPLIT_DIR", os.path.join(self.args.output_dir, "client_splits")
+                    )
+                    retain_idx_path = None
+                    m = re.match(r"client(\d+)_", eval_stage)
+                    if eval_stage.startswith("server"):
+                        retain_idx_path = os.path.join(split_dir, "global_retain_indices.json")
+                    elif m:
+                        cidx = int(m.group(1))
+                        retain_idx_path = os.path.join(split_dir, f"client{cidx}_retain_indices.json")
+
+                    forget_idx_path = resolve_forget_indices_path(
+                        split_dir=split_dir,
+                        stage=eval_stage,
+                        source_to_targets=active_map,
+                        source_client_indices=sorted(active_map.keys()),
+                        forget_source_idx=forget_source_idx,
+                        active_source_client_indices=forget_sources,
+                    )
+
+                    if hasattr(self.evaluator, "eval_cfg"):
+                        if hasattr(self.evaluator.eval_cfg, "tofu"):
+                            eval_tofu = self.evaluator.eval_cfg.tofu
+                            if not forget_idx_path or not os.path.exists(forget_idx_path):
+                                logger.error(
+                                    f"Forget indices missing for stage {eval_stage}: {forget_idx_path}. "
+                                    "Abort eval to avoid falling back to full dataset."
+                                )
+                                continue
+                            eval_tofu.forget_indices_path = forget_idx_path
+                            if retain_idx_path:
+                                if not os.path.exists(retain_idx_path):
+                                    logger.error(
+                                        f"Retain indices missing for stage {eval_stage}: {retain_idx_path}. "
+                                        "Abort eval to avoid falling back to full dataset."
+                                    )
+                                    continue
+                                eval_tofu.retain_indices_path = retain_idx_path
+                            self._update_eval_dataset_indices(eval_tofu)
+
+                        if hasattr(self.evaluator.eval_cfg, "muse"):
+                            eval_muse = self.evaluator.eval_cfg.muse
+                            if not forget_idx_path or not os.path.exists(forget_idx_path):
+                                logger.error(
+                                    f"MUSE forget indices missing for stage {eval_stage}: {forget_idx_path}. "
+                                    "Abort eval to avoid falling back to full dataset."
+                                )
+                                continue
+                            eval_muse.forget_indices_path = forget_idx_path
+                            self._update_eval_dataset_indices(eval_muse)
+
+                        if hasattr(self.evaluator, "metrics"):
+                            for metric in self.evaluator.metrics.values():
+                                if hasattr(metric, "data"):
+                                    metric.data = None
+                                if hasattr(metric, "collators"):
+                                    metric.collators = None
+                except Exception as exc:
+                    logger.warning(f"Failed to set eval indices dynamically for {eval_stage}: {exc}")
+                    continue
+
+                eval_dir = os.path.join(
+                    self.args.output_dir,
+                    "eval_rounds",
+                    f"round_{round_idx + 1}",
+                    eval_stage,
+                )
+                os.makedirs(eval_dir, exist_ok=True)
+
+                summary_file = os.path.join(eval_dir, "TOFU_SUMMARY.json")
+                summary_exists = os.path.isfile(summary_file) and os.path.getsize(summary_file) > 0
+                if summary_exists and not force_eval:
+                    logger.info(
+                        f"Skipping eval for stage {eval_stage} at round {round_idx + 1}, existing summary: {summary_file}"
+                    )
+                    continue
+
+                try:
+                    self.evaluator.evaluate(
+                        model=model,
+                        tokenizer=self.tokenizer,
+                        template_args=self.template_args,
+                        output_dir=eval_dir,
+                        overwrite=overwrite,
+                    )
+                except Exception as exc:
+                    logger.warning(f"Evaluation failed at {eval_stage} (round {round_idx}): {exc}")
         finally:
             if torch.cuda.is_available() and model_was_on_cpu:
                 model = model.cpu()
@@ -453,36 +799,51 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
             if pre_compute_cfg:
                 for _, pre_cfg in pre_compute_cfg.items():
                     _update_datasets(pre_cfg.get("datasets", None))
+
     def _reuse_server_post_eval(self, round_idx: int, target_stage: str) -> bool:
         """
         Reuse previous round server_post_agg eval as current pre_train eval.
         """
         if self.evaluator is None or round_idx == 0:
             return False
-        prev_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx}",
-            "server_post_agg",
-        )
-        src_summary = os.path.join(prev_dir, "TOFU_SUMMARY.json")
-        if not os.path.isfile(src_summary):
+        if self.source_client_indices and not self._forget_eval_sources():
             return False
-
-        dest_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx + 1}",
-            target_stage,
-        )
-        os.makedirs(dest_dir, exist_ok=True)
-
         copied = False
-        for fname in os.listdir(prev_dir):
-            src = os.path.join(prev_dir, fname)
-            if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(dest_dir, fname))
-                copied = True
+        active_map = self._active_source_to_targets()
+        for eval_stage, forget_source_idx in build_eval_variants(
+            target_stage,
+            self._forget_eval_sources(),
+            source_to_targets=active_map,
+            source_client_indices=sorted(active_map.keys()),
+        ):
+            src_stage = (
+                "server_post_agg"
+                if forget_source_idx is None
+                else f"server_post_agg__forget_src_{forget_source_idx}"
+            )
+            prev_dir = os.path.join(
+                self.args.output_dir,
+                "eval_rounds",
+                f"round_{round_idx}",
+                src_stage,
+            )
+            src_summary = os.path.join(prev_dir, "TOFU_SUMMARY.json")
+            if not os.path.isfile(src_summary):
+                continue
+
+            dest_dir = os.path.join(
+                self.args.output_dir,
+                "eval_rounds",
+                f"round_{round_idx + 1}",
+                eval_stage,
+            )
+            os.makedirs(dest_dir, exist_ok=True)
+
+            for fname in os.listdir(prev_dir):
+                src = os.path.join(prev_dir, fname)
+                if os.path.isfile(src):
+                    shutil.copy2(src, os.path.join(dest_dir, fname))
+                    copied = True
         if copied:
             logger.info(
                 f"Reused server_post_agg eval (round {round_idx}) for stage {target_stage}"
@@ -495,30 +856,44 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         """
         if self.evaluator is None:
             return False
-        src_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx + 1}",
-            "server_pre_agg",
-        )
-        src_summary = os.path.join(src_dir, "TOFU_SUMMARY.json")
-        if not os.path.isfile(src_summary):
+        if self.source_client_indices and not self._forget_eval_sources():
             return False
-
-        dest_dir = os.path.join(
-            self.args.output_dir,
-            "eval_rounds",
-            f"round_{round_idx + 1}",
-            target_stage,
-        )
-        os.makedirs(dest_dir, exist_ok=True)
-
         copied = False
-        for fname in os.listdir(src_dir):
-            src = os.path.join(src_dir, fname)
-            if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(dest_dir, fname))
-                copied = True
+        active_map = self._active_source_to_targets()
+        for eval_stage, forget_source_idx in build_eval_variants(
+            target_stage,
+            self._forget_eval_sources(),
+            source_to_targets=active_map,
+            source_client_indices=sorted(active_map.keys()),
+        ):
+            src_stage = (
+                "server_pre_agg"
+                if forget_source_idx is None
+                else f"server_pre_agg__forget_src_{forget_source_idx}"
+            )
+            src_dir = os.path.join(
+                self.args.output_dir,
+                "eval_rounds",
+                f"round_{round_idx + 1}",
+                src_stage,
+            )
+            src_summary = os.path.join(src_dir, "TOFU_SUMMARY.json")
+            if not os.path.isfile(src_summary):
+                continue
+
+            dest_dir = os.path.join(
+                self.args.output_dir,
+                "eval_rounds",
+                f"round_{round_idx + 1}",
+                eval_stage,
+            )
+            os.makedirs(dest_dir, exist_ok=True)
+
+            for fname in os.listdir(src_dir):
+                src = os.path.join(src_dir, fname)
+                if os.path.isfile(src):
+                    shutil.copy2(src, os.path.join(dest_dir, fname))
+                    copied = True
         if copied:
             logger.info(
                 f"Reused server_pre_agg eval (round {round_idx + 1}) for stage {target_stage}"
@@ -537,7 +912,6 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         filtered.pop("retain_indices_path", None)
         filtered.pop("forget_indices_path", None)
         filtered.pop("assign_forget_to_revoker_only", None)
-        filtered.pop("revoker_client_idx", None)
         filtered.pop("init_all_clients_from_unlearn", None)
         return filtered
 
@@ -673,12 +1047,6 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
 
         unlearn_trainer.train()
 
-        # 记录遗忘后参数
-        if self.is_peft:
-            self.theta_unlearn_state = get_peft_model_state_dict(unlearn_trainer.model)
-        else:
-            self.theta_unlearn_state = unlearn_trainer.model.state_dict()
-        
         return unlearn_trainer
     
 
@@ -750,14 +1118,26 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         logger.info("Aggregating client models")
         
 
-        total_samples = sum(self.client_data_sizes)
-        if total_samples == 0:
+        active_client_indices = [
+            client_idx
+            for client_idx, model in enumerate(self.client_models)
+            if model is not None and self.client_data_sizes[client_idx] > 0
+        ]
+        total_samples = sum(self.client_data_sizes[client_idx] for client_idx in active_client_indices)
+        if total_samples == 0 or not active_client_indices:
             logger.warning("No samples available for aggregation")
             return
             
-        client_weights = [size / total_samples for size in self.client_data_sizes]
+        client_weights = [
+            self.client_data_sizes[client_idx] / total_samples
+            for client_idx in active_client_indices
+        ]
         logger.info(f"Client sample sizes: {self.client_data_sizes}")
-        logger.info(f"Client weights: {[f'{w:.4f}' for w in client_weights]}")
+        logger.info(
+            "Aggregating active clients: %s with weights: %s",
+            active_client_indices,
+            [f"{w:.4f}" for w in client_weights],
+        )
 
         # Determine target device for aggregation (prefer GPU if available)
         use_gpu_for_agg = torch.cuda.is_available()
@@ -765,7 +1145,8 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         
         if self.is_peft:
             client_state_dicts = []
-            for idx, model in enumerate(self.client_models):
+            for idx in active_client_indices:
+                model = self.client_models[idx]
                 # Extract state dict without moving to CPU first
                 peft_state_dict = get_peft_model_state_dict(model)
                 # Move to aggregation device if needed
@@ -777,7 +1158,8 @@ class FederatedUnlearningTrainer(FinetuneTrainer):
         else:
 
             client_state_dicts = []
-            for idx, model in enumerate(self.client_models):
+            for idx in active_client_indices:
+                model = self.client_models[idx]
                 # Extract state dict without moving to CPU first
                 state = model.state_dict()
                 # Move to aggregation device if needed

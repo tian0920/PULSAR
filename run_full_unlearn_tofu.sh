@@ -7,8 +7,8 @@ export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 source "${SCRIPT_DIR}/scripts/lib/fedperm_common.sh"
 
 # 可选：可通过参数或环境变量覆盖的配置
-FL_METHOD="${FL_METHOD:-FedAvg,FedAvgM}" # FedAvg,FedAvgM,FedYogi,FedProx,FedAdam,FedAdagrad
-DEFAULT_UNLEARN_CLS=("GradAscent" "NPO" "SimNPO" "GradDiff")  # "NPO" "SimNPO" "GradAscent" "GradDiff"
+FL_METHOD="${FL_METHOD:-FedAvg,FedProx,FedAdam,FedAWA,FedLWS}" # FedAvg,FedAvgM,FedYogi,FedProx,FedAdam,FedAdagrad
+DEFAULT_UNLEARN_CLS=("GradAscent" "NPO" "SimNPO" "GradDiff" "CEU" "PDU" "UNDIAL" "WGA")  # "NPO" "SimNPO" "GradAscent" "GradDiff"
 UNLEARN_CLS=("${DEFAULT_UNLEARN_CLS[@]}")
 LAUNCHER=(python)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -22,6 +22,8 @@ PARALLEL_CLIENT_WORKERS="${PARALLEL_CLIENT_WORKERS:-0}"
 PARALLEL_FILTER_WORKERS="${PARALLEL_FILTER_WORKERS:-0}"
 CLIENT_PARALLEL_DEVICES="${CLIENT_PARALLEL_DEVICES:-}"
 FILTER_PARALLEL_DEVICES="${FILTER_PARALLEL_DEVICES:-}"
+PARTICIPATION_RATIO="${PARTICIPATION_RATIO:-0.1}"
+MIN_PARTICIPATING_CLIENTS="${MIN_PARTICIPATING_CLIENTS:-3}"
 
 COMMON_PARALLEL_ARGS=(
   ++trainer.method_args.parallel_client_workers="${PARALLEL_CLIENT_WORKERS}"
@@ -42,8 +44,18 @@ if [ -n "${FILTER_PARALLEL_DEVICES}" ]; then
   )
 fi
 
+PARTICIPATION_ARGS=(
+  ++trainer.method_args.participation_ratio="${PARTICIPATION_RATIO}"
+  ++trainer.method_args.min_participating_clients="${MIN_PARTICIPATING_CLIENTS}"
+)
+
 # 是否运行+保存所有 pre 评测，默认关闭以节省时间
 ENABLE_PRE_EVAL="${ENABLE_PRE_EVAL:-false}"
+
+# Target 客户端在常规 post_train 评测外，额外用「当轮已采样全部 source 的 forget 合并」再评一次；
+# 输出：eval_rounds/round_*/client{n}_post_train__forget_merge_round_sources/TOFU_SUMMARY.json
+# 关闭：EVAL_TARGET_ROUND_FORGET_MERGE=false
+export EVAL_TARGET_ROUND_FORGET_MERGE="${EVAL_TARGET_ROUND_FORGET_MERGE:-false}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -80,14 +92,23 @@ MODELS=("Llama-3.2-1B-Instruct-lora")  # Qwen2.5-1.5B-Instruct-lora, Llama-3.2-1
 FORGET_SPLITS=("forget10")
 HOLDOUT_SPLITS=("holdout10")
 RETAIN_SPLITS=("retain90")
-NUM_CLIENTS="${NUM_CLIENTS:-10}"
-NUM_SOURCE_CLIENTS="${NUM_SOURCE_CLIENTS:-3}"
-NUM_TARGETS_PER_SOURCE="${NUM_TARGETS_PER_SOURCE:-3}"
-SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-0,3,7}"      # 指定 "0,3,7"
-SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-{0:[1,2,4],3:[4,5,8],7:[3,6,8]}}"
+# NUM_CLIENTS="${NUM_CLIENTS:-100}"
+# NUM_SOURCE_CLIENTS="${NUM_SOURCE_CLIENTS:-2}"
+# NUM_TARGETS_PER_SOURCE="${NUM_TARGETS_PER_SOURCE:-2}"
+# SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-0,5}"      # 指定 "0,3,7"
+# SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-{0:[2,4],5:[3,7]}}"  ## {0:[1,2,4],3:[4,5,8],7:[3,6,8]}
+
+NUM_CLIENTS="${NUM_CLIENTS:-100}"
+# 以下为全局 source 候选池与数据划分（fedperm_topology）；每轮实际映射由 Trainer 写入 participation.json
+NUM_SOURCE_CLIENTS="${NUM_SOURCE_CLIENTS:-10}"
+NUM_TARGETS_PER_SOURCE="${NUM_TARGETS_PER_SOURCE:-2}"
+SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES:-0,10,20,30,40,50,60,70,80,90}"      # 指定 "0,3,7"
+SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS:-{0:[3,6],10:[13,16],20:[23,26],30:[33,36],40:[43,46],50:[53,56],60:[63,66],70:[73,76],80:[83,86],90:[93,96]}}"  ## {0:[1,2,4],3:[4,5,8],7:[3,6,8]}"
+MIN_SOURCE_CLIENTS_PER_ROUND="${MIN_SOURCE_CLIENTS_PER_ROUND:-2}"
+TARGETS_PER_SOURCE_PER_ROUND="${TARGETS_PER_SOURCE_PER_ROUND:-2}"
+
 RETAIN_CLIENT_WEIGHTS="${RETAIN_CLIENT_WEIGHTS:-}"  # {0: 2, 1: 1, 2: 1, 3: 0.5}
 FORGET_SOURCE_WEIGHTS="${FORGET_SOURCE_WEIGHTS:-}"  # [0, 3, 7]
-USE_CLIENT_FORGET_EVAL=true   # forget_utility 是否用源客户端的 forget indices
 ASSIGN_FORGET_TO_REVOKER_ONLY=true   # 数据集划分方式
 if [ "${ASSIGN_FORGET_TO_REVOKER_ONLY}" = "true" ]; then
   LOG_ROOT="logs/TOFU/fedperm_only"
@@ -97,15 +118,10 @@ else
   OUT_ROOT="saves/TOFU/fedperm"
 fi
 
-TARGET_CLIENT_IDX=1
-REVOKER_CLIENT_IDX=0
-CLIENT_C_IDX=2
 ENABLE_PERMUTATION=false    # 神经元转置
 
 TOPOLOGY_ARGS=(
   ++trainer.method_args.num_clients="${NUM_CLIENTS}"
-  ++trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}"
-  ++trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}"
 )
 if [ -n "${NUM_SOURCE_CLIENTS}" ]; then
   TOPOLOGY_ARGS+=(
@@ -138,8 +154,13 @@ if [ -n "${FORGET_SOURCE_WEIGHTS}" ]; then
   )
 fi
 
+ROUND_TOPOLOGY_ARGS=(
+  ++trainer.method_args.min_source_clients_per_round="${MIN_SOURCE_CLIENTS_PER_ROUND}"
+  ++trainer.method_args.targets_per_source_per_round="${TARGETS_PER_SOURCE_PER_ROUND}"
+)
+
 # full 阶段
-FULL_GLOBAL_ROUNDS=4
+FULL_GLOBAL_ROUNDS=10
 FULL_SAVE_INTERVAL=0     # full 阶段：0 每轮保存并逐轮评测，>0 间隔保存
 PRE_BASE_OFFSET="${PRE_BASE_OFFSET:-1}"  # 取最后几轮前的基线（默认 1）
 PRE_BASE_OFFSETS="1"  # 逗号分隔，遍历多个 offset  ,2,3,4
@@ -153,7 +174,7 @@ UNLEARN_SAVE_INTERVAL=0  # unlearn 阶段：同上
 
 UNLEARN_EPOCHS=1   # 过滤器训练轮次
 FILTER_ALPHA=1     # θ_g^t-(θ_g^{t-1}-alpha*θ_unlearn)
-LEARNING_RATE="${LEARNING_RATE:-8e-5}"
+LEARNING_RATE="${LEARNING_RATE:-8e-5}"  ## 8e-5
 
 # 遗忘阶段目标客户端B本地LOSS正则锚点/双CE开关
 
@@ -213,14 +234,13 @@ check_rounds_exist() {
 
 resolve_target_clients() {
   local split_dir="$1"
-  local fallback_target="$2"
   SOURCE_TO_TARGETS="${SOURCE_TO_TARGETS}" \
   SOURCE_CLIENT_INDICES="${SOURCE_CLIENT_INDICES}" \
-  TARGET_CLIENT_IDX="${fallback_target}" \
   python3 - "$split_dir" <<'PY'
 import json
 import os
 import sys
+import ast
 
 split_dir = sys.argv[1]
 topology = None
@@ -229,7 +249,10 @@ if env_mapping:
     try:
         topology = json.loads(env_mapping)
     except Exception:
-        topology = None
+        try:
+            topology = ast.literal_eval(env_mapping)
+        except Exception:
+            topology = None
 
 if topology is None:
     path = os.path.join(split_dir, "fedperm_topology.json")
@@ -245,9 +268,7 @@ if topology:
             targets.add(int(value))
 
 if not targets:
-    fallback = os.environ.get("TARGET_CLIENT_IDX", "").strip()
-    if fallback:
-        targets.add(int(fallback))
+    raise SystemExit("No target clients resolved from source_to_targets")
 
 print(",".join(str(v) for v in sorted(targets)))
 PY
@@ -315,14 +336,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       COMMON_SPLIT_DIR="${OUT_ROOT}/client_splits/${RETAIN_SPLIT}_${FORGET_SPLIT}_seed${SEED}"
       mkdir -p "${COMMON_SPLIT_DIR}"
       export FEDPERM_SPLIT_DIR="${COMMON_SPLIT_DIR}"
-      RETAIN_IDX_FILE="${COMMON_SPLIT_DIR}/global_retain_indices.json"
-      FORGET_IDX_FILE="${COMMON_SPLIT_DIR}/global_forget_indices.json"
-      SPLITS_READY=false
-      SPLITS_READY=false
-      if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
-        SPLITS_READY=true
-        echo "Found existing global indices, reuse: ${COMMON_SPLIT_DIR}"
-      fi
 
       ########################################
       # 阶段 1：full 数据联邦训练（默认每轮保存+评测）
@@ -335,8 +348,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
 
       PRE_BASE_ROUND=$((FULL_GLOBAL_ROUNDS - PRE_BASE_OFFSET))
       PRE_BASE_SRC="${FULL_DIR}/round_${PRE_BASE_ROUND}"
-      TARGET_CLIENTS_CSV="$(resolve_target_clients "${COMMON_SPLIT_DIR}" "${TARGET_CLIENT_IDX}")"
-      PREV_TARGET_PATH="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_target_client_${TARGET_CLIENT_IDX}"
+      TARGET_CLIENTS_CSV="$(resolve_target_clients "${COMMON_SPLIT_DIR}")"
       FORCE_FULL_RERUN=false
       FULL_DONE=false
 
@@ -366,21 +378,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       if [ "${FULL_DONE}" != true ]; then
         EXTRA_EVAL_ARGS=()
         SAVE_SPLITS_FOR_EVAL=true
-        if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
-          EXTRA_EVAL_ARGS+=(
-            ++eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
-            ++eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
-          )
-        fi
-        # 若公共划分已存在，直接复用，不再生成新划分
-        if [ "${SPLITS_READY}" = true ]; then
-          SAVE_SPLITS_FOR_EVAL=false
-          EXTRA_EVAL_ARGS+=(
-            +trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}"
-            +trainer.method_args.forget_indices_path="${FORGET_IDX_FILE}"
-            trainer.method_args.save_client_splits_for_eval=false
-          )
-        fi
 
         SKIP_ROUNDS=$(compute_skip_rounds "${FULL_GLOBAL_ROUNDS}" "${FULL_SAVE_INTERVAL}")
         FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
@@ -397,9 +394,12 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.method_args.retain_split_name="${RETAIN_SPLIT}" \
           trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
           trainer.method_args.save_target_client_checkpoint=true \
+          trainer.method_args.save_target_client_final_only=true \
           trainer.method_args.save_client_splits_for_eval="${SAVE_SPLITS_FOR_EVAL}" \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
+          "${PARTICIPATION_ARGS[@]}" \
           "${TOPOLOGY_ARGS[@]}" \
+          "${ROUND_TOPOLOGY_ARGS[@]}" \
           "${COMMON_PARALLEL_ARGS[@]}" \
           data/datasets@data.train=TOFU_QA_full \
           data.train.TOFU_QA_full.args.hf_args.name=full \
@@ -410,9 +410,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.args.learning_rate="${LEARNING_RATE}" \
           "${EXTRA_EVAL_ARGS[@]}" \
           2>&1 | tee "${LOG_ROOT}/${FULL_TASK}.txt"
-        if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
-          SPLITS_READY=true
-        fi
       fi
 
       # 预留 unlearn 起点：确保 PRE_BASE_ROUND 的检查点存在
@@ -431,11 +428,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       ########################################
       # 阶段 2：基于 full 模型的 FedPerm 遗忘 + 恢复（每轮评测）
       ########################################
-      if [ "${SPLITS_READY}" != true ]; then
-        echo "缺少公共划分文件：${COMMON_SPLIT_DIR}，请先生成全局索引后再运行遗忘阶段。" >&2
-        exit 1
-      fi
-      TARGET_CLIENTS_CSV="$(resolve_target_clients "${COMMON_SPLIT_DIR}" "${TARGET_CLIENT_IDX}")"
+      TARGET_CLIENTS_CSV="$(resolve_target_clients "${COMMON_SPLIT_DIR}")"
       SAVE_INTERVAL=${UNLEARN_SAVE_INTERVAL}
       for UNLEARN_METHOD in "${UNLEARN_CLS[@]}"; do
         echo "------- UNLEARN_METHOD=${UNLEARN_METHOD} -------"
@@ -448,17 +441,11 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           echo "Skip FedPerm unlearn, final round exists: ${FEDPERM_DIR}/round_${UNLEARN_GLOBAL_ROUNDS}"
         else
           EXTRA_EVAL_ARGS=()
-          if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
-            EXTRA_EVAL_ARGS+=(
-              ++eval.tofu.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
-              ++eval.tofu.forget_dataset_name="${FORGET_SPLIT}"
-            )
-          fi
 
           SKIP_ROUNDS=$(compute_skip_rounds "${UNLEARN_GLOBAL_ROUNDS}" "${UNLEARN_SAVE_INTERVAL}")
           TARGET_PREV_CE_ARGS=()
           if [ "${TARGET_PREV_CE_ENABLED}" = "true" ]; then
-            PREV_TARGET_PATHS_EXPR="$(build_prev_target_model_paths_expr "${FULL_DIR}" "${FULL_GLOBAL_ROUNDS}" "${TARGET_CLIENTS_CSV}")"
+            PREV_TARGET_PATHS_EXPR="$(build_prev_target_model_paths_expr "${FULL_DIR}" "${PRE_BASE_ROUND}" "${TARGET_CLIENTS_CSV}")"
             TARGET_PREV_CE_ARGS+=("++trainer.method_args.prev_target_model_paths=${PREV_TARGET_PATHS_EXPR}")
           fi
           FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
@@ -481,27 +468,27 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
             trainer.method_args.filter_alpha="${FILTER_ALPHA}" \
             trainer.method_args.unlearn_trainer_cls="${UNLEARN_METHOD}" \
             trainer.method_args.aggregation_strategy="${CURRENT_FL_METHOD}" \
-            trainer.method_args.save_client_splits_for_eval=false \
-            +trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}" \
-            +trainer.method_args.forget_indices_path="${FORGET_IDX_FILE}" \
             trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
-            trainer.method_args.eval_client_c_idx="${CLIENT_C_IDX}" \
             trainer.method_args.target_prev_ce_enabled="${TARGET_PREV_CE_ENABLED}" \
             trainer.method_args.target_prev_ce_weight="${TARGET_PREV_CE_WEIGHT}" \
+            "${PARTICIPATION_ARGS[@]}" \
             "${TOPOLOGY_ARGS[@]}" \
+            "${ROUND_TOPOLOGY_ARGS[@]}" \
             "${FEDPERM_PARALLEL_ARGS[@]}" \
             +trainer.method_args.unlearn_base_full_rounds="${FULL_GLOBAL_ROUNDS}" \
             +trainer.method_args.unlearn_base_offset="${PRE_BASE_OFFSET}" \
             +trainer.method_args.unlearn_base_full_dir="${FULL_DIR}" \
+            +trainer.method_args.round_offset="${FULL_GLOBAL_ROUNDS}" \
+            +trainer.method_args.data_partition_seed="${SEED}" \
             "${TARGET_PREV_CE_ARGS[@]}" \
             +trainer.method_args.enable_permutation="${ENABLE_PERMUTATION}" \
             data/datasets@data.train=TOFU_QA_full \
             data.train.TOFU_QA_full.args.hf_args.name=full \
-            model.model_args.pretrained_model_name_or_path="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}" \
+            model.model_args.pretrained_model_name_or_path="${FULL_DIR}/round_${PRE_BASE_ROUND}" \
             trainer.args.output_dir="${FEDPERM_DIR}" \
             trainer.args.save_strategy="epoch" \
             paths.output_dir="${FEDPERM_DIR}" \
-            trainer.args.seed="${SEED}" \
+            trainer.args.seed="$((SEED + FULL_GLOBAL_ROUNDS))" \
             trainer.args.learning_rate="${LEARNING_RATE}" \
             "${EXTRA_EVAL_ARGS[@]}" \
             2>&1 | tee "${LOG_ROOT}/${FEDPERM_TASK}.txt"

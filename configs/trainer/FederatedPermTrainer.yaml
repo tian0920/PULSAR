@@ -14,12 +14,14 @@ method_args:
   global_rounds: 10
   filter_alpha: 0.5
   aggregation_lr: 1.0
+  participation_ratio: 1.0
+  min_participating_clients: 1
+  participation_seed: 42
   enable_revocation: true
   normal_rounds_before_forget: 4
   forget_round_count: 3
   recovery_round_start: 7
   recovery_lr: null        # Optional LR override for recovery phase (null to disable)
-  eval_client_c_idx: -1  # Which client to use for C-side eval; -1 to skip
   save_client_splits_for_eval: false  # Save split indices for client-level forget eval
   retain_indices_path: null           # Optional: reuse precomputed retain indices
   forget_indices_path: null           # Optional: reuse precomputed forget indices

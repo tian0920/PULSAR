@@ -7,6 +7,9 @@ method_args:
   aggregation_strategy: "FedAdam"  # FedAvg, FedAdam, FedYogi, FedAdagrad, FedAvgM
   global_rounds: 2  # Total number of global training rounds
   unlearn_epochs: 50  # Unlearning phase specific epoch settings
+  participation_ratio: 1.0
+  min_participating_clients: 1
+  participation_seed: null
 
 args:
   per_device_train_batch_size: 32

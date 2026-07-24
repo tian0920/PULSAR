@@ -3,8 +3,6 @@ from omegaconf import DictConfig, open_dict
 from data import (
     get_data,
     get_collators,
-    get_federated_data,
-    get_federated_full_retain_forget,
 )
 from data.qa import QADataset
 from data.pretraining import PretrainingDataset
@@ -12,126 +10,13 @@ from model import get_model
 from trainer import load_trainer
 from evals import get_evaluator
 from trainer.utils import seed_everything
-from torch.utils.data import Subset
+from torch.utils.data import Subset, ConcatDataset
 import numpy as np
 import os
 import logging
 import json
 
 logger = logging.getLogger(__name__)
-
-
-def _normalize_client_indices(indices, num_clients):
-    if indices is None:
-        return []
-    resolved = []
-    for idx in indices:
-        client_idx = int(idx)
-        if client_idx < 0 or client_idx >= num_clients:
-            raise ValueError(
-                f"Client index {client_idx} out of range for num_clients={num_clients}"
-            )
-        resolved.append(client_idx)
-    return sorted(dict.fromkeys(resolved))
-
-
-def _normalize_source_to_targets(source_to_targets, num_clients):
-    if source_to_targets is None:
-        return None
-    normalized = {}
-    for raw_src, raw_targets in source_to_targets.items():
-        src_idx = int(raw_src)
-        if src_idx < 0 or src_idx >= num_clients:
-            raise ValueError(
-                f"Source client index {src_idx} out of range for num_clients={num_clients}"
-            )
-        target_indices = _normalize_client_indices(raw_targets, num_clients)
-        if src_idx in target_indices:
-            raise ValueError(
-                f"Source client {src_idx} cannot target itself in source_to_targets"
-            )
-        normalized[src_idx] = target_indices
-    return normalized
-
-
-def _load_saved_topology(split_dirs):
-    for split_dir in split_dirs:
-        if not split_dir:
-            continue
-        topology_path = os.path.join(split_dir, "fedperm_topology.json")
-        if os.path.isfile(topology_path):
-            with open(topology_path, "r") as f:
-                return json.load(f)
-    return None
-
-
-def _resolve_source_target_topology(method_args, num_clients, seed, split_save_dir=None):
-    saved_topology = _load_saved_topology(
-        [os.environ.get("FEDPERM_SPLIT_DIR"), split_save_dir]
-    )
-    explicit_mapping = method_args.get("source_to_targets", None)
-    if explicit_mapping is not None:
-        normalized = _normalize_source_to_targets(explicit_mapping, num_clients)
-        return normalized, sorted(normalized.keys())
-
-    if saved_topology and saved_topology.get("source_to_targets"):
-        normalized = _normalize_source_to_targets(
-            saved_topology.get("source_to_targets"), num_clients
-        )
-        return normalized, sorted(normalized.keys())
-
-    explicit_sources = _normalize_client_indices(
-        method_args.get("source_client_indices", None),
-        num_clients,
-    )
-    if not explicit_sources and saved_topology and saved_topology.get("source_client_indices"):
-        explicit_sources = _normalize_client_indices(
-            saved_topology.get("source_client_indices"),
-            num_clients,
-        )
-
-    num_source_clients = method_args.get("num_source_clients", None)
-    num_targets_per_source = method_args.get("num_targets_per_source", None)
-
-    if not explicit_sources:
-        if num_source_clients is None:
-            revoker_client_idx = method_args.get("revoker_client_idx", 0)
-            explicit_sources = [int(revoker_client_idx)]
-        else:
-            num_source_clients = int(num_source_clients)
-            if num_source_clients < 1 or num_source_clients > num_clients:
-                raise ValueError(
-                    f"num_source_clients must be in [1, {num_clients}], got {num_source_clients}"
-                )
-            rng = np.random.RandomState(seed)
-            explicit_sources = sorted(
-                rng.choice(num_clients, size=num_source_clients, replace=False).tolist()
-            )
-
-    if num_targets_per_source is None:
-        if len(explicit_sources) == 1 and method_args.get("target_client_idx", None) is not None:
-            target_client_idx = int(method_args.get("target_client_idx"))
-            if target_client_idx == explicit_sources[0]:
-                raise ValueError("target_client_idx cannot be identical to source client")
-            return {explicit_sources[0]: [target_client_idx]}, explicit_sources
-        num_targets_per_source = 1
-
-    num_targets_per_source = int(num_targets_per_source)
-    rng = np.random.RandomState(seed)
-    source_to_targets = {}
-    for offset, src_idx in enumerate(explicit_sources):
-        candidates = [idx for idx in range(num_clients) if idx != src_idx]
-        if num_targets_per_source < 1 or num_targets_per_source > len(candidates):
-            raise ValueError(
-                f"num_targets_per_source must be in [1, {len(candidates)}] for source client {src_idx}"
-            )
-        local_rng = np.random.RandomState(seed + offset + 1)
-        sampled_targets = local_rng.choice(
-            candidates, size=num_targets_per_source, replace=False
-        ).tolist()
-        source_to_targets[src_idx] = sorted(int(idx) for idx in sampled_targets)
-
-    return source_to_targets, explicit_sources
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train.yaml")
@@ -185,41 +70,17 @@ def main(cfg: DictConfig):
     if is_federated:
         method_args = cfg.trainer.method_args
         num_clients = method_args.get("num_clients", 3)
-        retain_ratio = method_args.get("retain_ratio", 0.90)
-        save_client_splits = method_args.get(
-            "save_client_splits_for_eval", False
-        )
-        assign_forget_to_revoker_only = method_args.get(
-            "assign_forget_to_revoker_only", False
-        )
-        revoker_client_idx = method_args.get("revoker_client_idx", 0)
-        retain_indices_path = method_args.get("retain_indices_path", None)
-        forget_indices_path = method_args.get("forget_indices_path", None)
-        global_retain_indices = method_args.get("global_retain_indices", None)
-        global_forget_indices = method_args.get("global_forget_indices", None)
-        retain_split_name = method_args.get("retain_split_name", None)
-        forget_split_name = method_args.get("forget_split_name", None)
-        split_save_dir = None
-        if save_client_splits:
-            split_save_dir = os.environ.get("FEDPERM_SPLIT_DIR", None)
-            if not split_save_dir:
-                split_save_dir = os.path.join(cfg.trainer.args.output_dir, "client_splits")
-        if split_save_dir:
-            os.makedirs(split_save_dir, exist_ok=True)
-        source_to_targets, source_client_indices = _resolve_source_target_topology(
-            method_args,
-            num_clients=num_clients,
-            seed=cfg.trainer.args.seed,
-            split_save_dir=split_save_dir,
-        )
-        with open_dict(method_args):
-            method_args["source_to_targets"] = {
-                str(src_idx): [int(tgt_idx) for tgt_idx in target_indices]
-                for src_idx, target_indices in source_to_targets.items()
-            }
-            method_args["source_client_indices"] = [
-                int(idx) for idx in source_client_indices
-            ]
+        
+        raw_sources = method_args.get("source_client_indices", [0])
+        if isinstance(raw_sources, str):
+            source_client_indices = [int(x.strip()) for x in raw_sources.split(",") if x.strip()]
+        elif isinstance(raw_sources, int):
+            source_client_indices = [raw_sources]
+        else:
+            source_client_indices = [int(x) for x in raw_sources]
+            
+        retain_split_name = method_args.get("retain_split_name", "retain")
+        forget_split_name = method_args.get("forget_split_name", "forget")
 
         def _load_split(split_name, split_kind: str):
             if split_name is None:
@@ -268,60 +129,54 @@ def main(cfg: DictConfig):
 
         retain_dataset_obj = _load_split(retain_split_name, "retain")
         forget_dataset_obj = _load_split(forget_split_name, "forget")
-        if mode == "unlearn":
-            if "forget" not in data or "retain" not in data:
-                raise ValueError("Both forget and retain data must be in data dictionary")
-            federated_data = get_federated_data(
-                data,
-                num_clients=num_clients,
-                target_client_idx=cfg.trainer.get("target_client_idx", 0),
-            )
-
-        else:  # mode == "train" for federated fine-tuning / FedPerm
-            if "train" not in data:
-                raise ValueError("Training data must be in data dictionary")
-            if retain_dataset_obj is None or forget_dataset_obj is None:
-                raise ValueError("retain_split_name and forget_split_name must be set for federated training")
-            train_data = data["train"]
-            federated_data = get_federated_full_retain_forget(
-                full_dataset=train_data,
-                num_clients=num_clients,
-                retain_ratio=retain_ratio,
-                seed=cfg.trainer.args.seed,
-                assign_forget_to_revoker_only=assign_forget_to_revoker_only,
-                revoker_client_idx=revoker_client_idx,
-                source_client_indices=source_client_indices,
-                source_to_targets=source_to_targets,
-                retain_client_weights=method_args.get("retain_client_weights", None),
-                forget_source_weights=method_args.get("forget_source_weights", None),
-                split_save_dir=split_save_dir,
-                retain_indices_path=retain_indices_path,
-                forget_indices_path=forget_indices_path,
-                global_retain_indices=global_retain_indices,
-                global_forget_indices=global_forget_indices,
-                retain_dataset=retain_dataset_obj,
-                forget_dataset=forget_dataset_obj,
-            )
         
-        data["train"] = federated_data
-        print(f"Prepared federated data for {num_clients} clients")
+        if retain_dataset_obj is None or forget_dataset_obj is None:
+            raise ValueError("Both retain and forget datasets must be loaded for this partitioning logic.")
+            
+        data_seed = method_args.get("data_partition_seed", cfg.trainer.args.seed)
+        rng = np.random.RandomState(data_seed)
+        
+        # (1) 数据划分方式：retain随机平分到各个客户端
+        retain_len = len(retain_dataset_obj)
+        retain_indices = rng.permutation(retain_len)
+        retain_splits = np.array_split(retain_indices, num_clients)
+        
+        federated_train_data = {}
+        federated_eval_data = {}
+        train_on = method_args.get("train_on", "full")
+        
+        for client_idx in range(num_clients):
+            client_retain_data = Subset(retain_dataset_obj, retain_splits[client_idx].tolist())
+            
+            if client_idx in source_client_indices and train_on != "retain":
+                # 每个源客户端使用全量的 forget 数据
+                client_train_data = ConcatDataset([client_retain_data, forget_dataset_obj])
+            else:
+                client_train_data = client_retain_data
+                
+            federated_train_data[client_idx] = client_train_data
+            
+            # (2) 评测时，各个客户端使用各自的本地retain数据集+全量的forget数据集测评
+            federated_eval_data[f"client_{client_idx}"] = ConcatDataset([client_retain_data, forget_dataset_obj])
+            
+        data["train"] = federated_train_data
+        data["eval"] = federated_eval_data
+        print(f"Prepared federated data for {num_clients} clients. Source clients: {source_client_indices}")
 
     collator_cfg = cfg.collator
     collator = get_collators(collator_cfg, tokenizer=tokenizer)
     trainer_cfg = cfg.trainer
     assert trainer_cfg is not None, "Please set trainer"
 
+    # 恢复加载自定义 evaluator 的逻辑，用于生成 TOFU_SUMMARY.json
     evaluator = None
     eval_cfgs = cfg.get("eval", None)
     selected_eval = None
     if cfg.get("hydra") and cfg.hydra.get("runtime") and cfg.hydra.runtime.get("choices"):
         selected_eval = cfg.hydra.runtime.choices.get("eval")
     if selected_eval is None:
-        # Fallback for shell wrappers that pin eval via env (e.g., EVAL_GROUP=muse).
         selected_eval = os.environ.get("EVAL_GROUP") or os.environ.get("EVAL_NAME")
 
-    # Normalise eval configs to a {name: cfg} mapping; some configs package under eval.<name>,
-    # while others inject directly. We only treat entries with a handler as evaluators.
     def has_handler(node):
         try:
             return node.get("handler", None) is not None
@@ -336,25 +191,14 @@ def main(cfg: DictConfig):
     if not eval_candidates and isinstance(eval_cfgs, (dict, DictConfig)) and has_handler(eval_cfgs):
         eval_candidates = {"default": eval_cfgs}
 
-    # Heuristic: align eval choice with dataset family when not explicitly provided.
-    data_train_cfg = {}
-    try:
-        data_train_cfg = cfg.data.get("train", {})
-    except Exception:
-        data_train_cfg = {}
+    data_train_cfg = cfg.data.get("train", {})
     train_keys = " ".join(list(getattr(data_train_cfg, "keys", lambda: [])()))
     train_keys_lower = train_keys.lower()
 
     if eval_candidates:
         chosen_eval = None
-        if selected_eval:
-            if selected_eval in eval_candidates:
-                chosen_eval = selected_eval
-            else:
-                raise ValueError(
-                    f"Eval choice '{selected_eval}' not found in available evaluators {list(eval_candidates.keys())}. "
-                    "请通过 eval=<name> 或环境变量 EVAL_GROUP/EVAL_NAME 选择正确的评测配置。"
-                )
+        if selected_eval and selected_eval in eval_candidates:
+            chosen_eval = selected_eval
         elif "muse" in eval_candidates and "muse" in train_keys_lower:
             chosen_eval = "muse"
         elif "tofu" in eval_candidates and "tofu" in train_keys_lower:
@@ -362,20 +206,10 @@ def main(cfg: DictConfig):
         elif len(eval_candidates) == 1:
             chosen_eval = next(iter(eval_candidates))
 
-        if chosen_eval is None:
-            raise ValueError(
-                f"检测到多个评测配置 {list(eval_candidates.keys())}，未能确定应使用哪一个。"
-                " 请显式指定 eval=<name>（Hydra 覆盖）或设置环境变量 EVAL_GROUP/EVAL_NAME。"
+        if chosen_eval is not None:
+            evaluator = get_evaluator(
+                chosen_eval, eval_candidates[chosen_eval], template_args=template_args, model=model, tokenizer=tokenizer
             )
-
-        eval_name, eval_cfg = chosen_eval, eval_candidates[chosen_eval]
-        evaluator = get_evaluator(
-            eval_name,
-            eval_cfg,
-            template_args=template_args,
-            model=model,
-            tokenizer=tokenizer,
-        )
 
     trainer, trainer_args = load_trainer(
         trainer_cfg=trainer_cfg,
@@ -393,10 +227,8 @@ def main(cfg: DictConfig):
         trainer.save_state()
         trainer.save_model(trainer_args.output_dir)
 
-    # trainer_args.do_eval = False
-
-    # if trainer_args.do_eval:
-    #     trainer.evaluate(metric_key_prefix="eval")
+    if trainer_args.do_eval:
+        trainer.evaluate()
 
 
 if __name__ == "__main__":

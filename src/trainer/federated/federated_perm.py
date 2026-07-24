@@ -6,6 +6,7 @@ import os
 import shutil
 import json
 import re
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from trainer.base import FinetuneTrainer
 from torch.utils.data import Dataset
@@ -19,6 +20,8 @@ from trainer.federated.federated_utils import (
     apply_adversarial_filter,
     apply_permutation,
     generate_permutation_key,
+    sample_participating_clients,
+    select_forced_group_clients,
 )
 from transformers.trainer_utils import IntervalStrategy, SaveStrategy
 from peft import PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
@@ -27,9 +30,12 @@ from transformers import default_data_collator
 from torch.optim import AdamW
 from torch.nn.utils import clip_grad_norm_
 from trainer.federated.eval_routing import (
+    ROUND_FORGET_MERGE_STAGE_SUFFIX,
     build_eval_variants,
     resolve_forget_indices_path,
     resolve_server_post_reuse_stage,
+    should_run_target_round_forget_merge_eval,
+    split_stage_for_forget_source,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,8 +56,8 @@ class FederatedPermTrainer(FinetuneTrainer):
         evaluator=None,
         template_args=None,
         num_clients=3,
-        target_client_idx=1,  # Client B
-        revoker_client_idx=0,  # Client A
+        target_client_idx=1,
+        revoker_client_idx=0,
         aggregation_strategy="FedAvg",
         global_rounds=1,
         filter_alpha=0.5,
@@ -114,8 +120,6 @@ class FederatedPermTrainer(FinetuneTrainer):
             "recovery_round_start",
             (max(self.forget_rounds) + 1) if self.forget_rounds else None,
         )
-        # C 类客户端中用于评测的一个索引（可指定），默认取第一个非 A/B
-        self.eval_client_c_idx = kwargs.get("eval_client_c_idx", None)
         # 目标客户端遗忘阶段：loss = CE_current + lambda * CE_prev_post(B)
         self.target_prev_ce_enabled = kwargs.get("target_prev_ce_enabled", False)
         self.target_prev_ce_weight = float(kwargs.get("target_prev_ce_weight", 1.0))
@@ -127,8 +131,6 @@ class FederatedPermTrainer(FinetuneTrainer):
         self.unlearn_base_full_dir = kwargs.get("unlearn_base_full_dir", None)
         self.source_to_targets = self._resolve_source_to_targets(
             kwargs.get("source_to_targets", None),
-            revoker_client_idx=revoker_client_idx,
-            target_client_idx=target_client_idx,
         )
         self.source_client_indices = sorted(self.source_to_targets.keys())
         self.target_to_sources = self._invert_source_to_targets(self.source_to_targets)
@@ -147,6 +149,25 @@ class FederatedPermTrainer(FinetuneTrainer):
         self.permutation_keys = {}
         self.client_models = []
         self.client_data_sizes = []
+        self.selected_clients = set()
+        self.participation_ratio = float(kwargs.get("participation_ratio", 1.0))
+        self.min_participating_clients = int(kwargs.get("min_participating_clients", 1))
+        participation_seed = kwargs.get("participation_seed", None)
+        if participation_seed is None:
+            participation_seed = getattr(self.args, "seed", 0)
+        self.participation_seed = int(participation_seed)
+        self.min_source_clients_per_round = int(kwargs.get("min_source_clients_per_round", 2))
+        self.targets_per_source_per_round = int(kwargs.get("targets_per_source_per_round", 2))
+        self.round_topology_seed = int(kwargs.get("round_topology_seed", self.participation_seed))
+        self.current_round_source_to_targets: Dict[int, List[int]] = {}
+        self.current_round_source_clients: List[int] = []
+        _etm = kwargs.get("eval_target_round_forget_merge", None)
+        if _etm is None:
+            self.eval_target_round_forget_merge = os.environ.get(
+                "EVAL_TARGET_ROUND_FORGET_MERGE", ""
+            ).lower() in ("1", "true", "yes", "on")
+        else:
+            self.eval_target_round_forget_merge = bool(_etm)
 
         self.is_peft = isinstance(self.model, PeftModel)
         # 保存策略归一化：支持枚举直接传入，缺省时默认逐轮保存
@@ -199,6 +220,12 @@ class FederatedPermTrainer(FinetuneTrainer):
         logger.info(f"Client parallel devices: {self.client_parallel_devices}, workers={self.parallel_client_workers}")
         logger.info(f"Filter parallel devices: {self.filter_parallel_devices}, workers={self.parallel_filter_workers}")
         logger.info(f"Forget rounds: {sorted(self.forget_rounds)}, recovery starts at: {self.recovery_round_start}")
+        logger.info(
+            "Client participation ratio: %s, min clients: %s, seed: %s",
+            self.participation_ratio,
+            self.min_participating_clients,
+            self.participation_seed,
+        )
         if self.prev_target_model_path:
             logger.info(f"Prev target model path: {self.prev_target_model_path}")
         if self.unlearn_base_full_rounds is not None and self.unlearn_base_offset is not None:
@@ -271,14 +298,14 @@ class FederatedPermTrainer(FinetuneTrainer):
             normalized.append(client_idx)
         return sorted(dict.fromkeys(normalized))
 
-    def _resolve_source_to_targets(self, source_to_targets, revoker_client_idx: int, target_client_idx: int):
+    def _resolve_source_to_targets(self, source_to_targets):
         topology = source_to_targets
         if topology is None:
             metadata = self._load_topology_metadata()
             if metadata:
                 topology = metadata.get("source_to_targets", None)
         if topology is None:
-            return {int(revoker_client_idx): [int(target_client_idx)]}
+            return {}
 
         normalized = {}
         for raw_src, raw_targets in topology.items():
@@ -344,6 +371,171 @@ class FederatedPermTrainer(FinetuneTrainer):
                 results[result_idx] = future.result()
         return results
 
+    def _eligible_clients(self) -> List[int]:
+        return [
+            client_idx for client_idx in range(self.num_clients) if client_idx in self.federated_dataset
+        ]
+
+    def _required_participating_clients(self, round_idx: int, is_forget_round: bool) -> List[int]:
+        del is_forget_round
+        eligible_clients = self._eligible_clients()
+        eligible_set = set(eligible_clients)
+        source_candidates = [
+            idx for idx in self.source_client_indices if idx in eligible_set
+        ]
+        target_candidates = [
+            idx for idx in self.target_client_indices if idx in eligible_set
+        ]
+        if self.source_client_indices and not source_candidates:
+            raise ValueError("No eligible source clients available for participation sampling")
+        if self.target_client_indices and not target_candidates:
+            raise ValueError("No eligible target clients available for participation sampling")
+        if source_candidates:
+            rng = random.Random(self.participation_seed + round_idx)
+            required_sources = min(
+                len(source_candidates),
+                max(1, self.min_source_clients_per_round),
+            )
+            forced_source_clients = sorted(rng.sample(source_candidates, required_sources))
+        else:
+            forced_source_clients = []
+        return sorted(
+            dict.fromkeys(
+                forced_source_clients
+                + select_forced_group_clients(
+                    eligible_clients=self._eligible_clients(),
+                    client_groups=[source_candidates, target_candidates],
+                    round_idx=round_idx,
+                    seed=self.participation_seed,
+                )
+            )
+        )
+
+    def _active_source_to_targets(self) -> Dict[int, List[int]]:
+        return self.current_round_source_to_targets or self.source_to_targets
+
+    def _round_topology_cache_path(self) -> str:
+        split_dir = os.environ.get(
+            "FEDPERM_SPLIT_DIR", os.path.join(self.args.output_dir, "client_splits")
+        )
+        os.makedirs(split_dir, exist_ok=True)
+        return os.path.join(split_dir, "fedperm_round_topology.json")
+
+    def _load_round_topology(self, round_idx: int) -> Optional[Dict[str, Any]]:
+        cache_path = self._round_topology_cache_path()
+        if not os.path.isfile(cache_path):
+            return None
+        try:
+            with open(cache_path, "r") as f:
+                payload = json.load(f)
+            rounds = payload.get("rounds", {})
+            entry = rounds.get(str(round_idx + 1))
+            if not entry:
+                return None
+            return {
+                "source_clients": [int(idx) for idx in entry.get("source_clients", [])],
+                "source_to_targets": {
+                    int(src): [int(tgt) for tgt in tgts]
+                    for src, tgts in (entry.get("source_to_targets", {}) or {}).items()
+                },
+            }
+        except Exception as exc:
+            logger.warning("Failed to load round topology cache: %s", exc)
+            return None
+
+    def _save_round_topology(self, round_idx: int):
+        cache_path = self._round_topology_cache_path()
+        payload = {"rounds": {}}
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path, "r") as f:
+                    payload = json.load(f)
+            except Exception:
+                payload = {"rounds": {}}
+        payload.setdefault("rounds", {})
+        payload["rounds"][str(round_idx + 1)] = {
+            "source_clients": [int(idx) for idx in self.current_round_source_clients],
+            "source_to_targets": {
+                str(src): [int(tgt) for tgt in tgts]
+                for src, tgts in self.current_round_source_to_targets.items()
+            },
+            "seed": int(self.round_topology_seed),
+        }
+        with open(cache_path, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    def _assign_round_source_targets(self, round_idx: int):
+        cached = self._load_round_topology(round_idx)
+        if cached:
+            self.current_round_source_clients = cached["source_clients"]
+            self.current_round_source_to_targets = cached["source_to_targets"]
+            return
+        selected = sorted(int(idx) for idx in self.selected_clients)
+        selected_set = set(selected)
+        source_pool = [idx for idx in self.source_client_indices if idx in selected_set]
+        if len(source_pool) < self.min_source_clients_per_round:
+            source_pool = selected
+        required_sources = min(len(source_pool), max(1, self.min_source_clients_per_round))
+        rng = random.Random(self.round_topology_seed + round_idx)
+        round_sources = sorted(rng.sample(source_pool, required_sources)) if required_sources > 0 else []
+        candidate_targets = [idx for idx in selected if idx not in round_sources]
+        mapping: Dict[int, List[int]] = {}
+        for offset, src_idx in enumerate(round_sources):
+            if not candidate_targets:
+                mapping[src_idx] = []
+                continue
+            local_rng = random.Random(self.round_topology_seed + round_idx * 9973 + offset + 1)
+            sample_n = min(len(candidate_targets), max(1, self.targets_per_source_per_round))
+            mapping[src_idx] = sorted(local_rng.sample(candidate_targets, sample_n))
+        self.current_round_source_clients = round_sources
+        self.current_round_source_to_targets = mapping
+        self._save_round_topology(round_idx)
+
+    def _select_participating_clients(self, round_idx: int, is_forget_round: bool) -> List[int]:
+        required_clients = self._required_participating_clients(round_idx, is_forget_round)
+        selected = sample_participating_clients(
+            eligible_clients=self._eligible_clients(),
+            participation_ratio=self.participation_ratio,
+            min_clients=self.min_participating_clients,
+            round_idx=round_idx,
+            seed=self.participation_seed,
+            forced_clients=required_clients,
+        )
+        logger.info(
+            "Round %s selected clients: %s%s",
+            round_idx + 1,
+            selected,
+            f" (forced={required_clients})" if required_clients else "",
+        )
+        return selected
+
+    def _save_participation_metadata(
+        self,
+        round_idx: int,
+        selected_clients: List[int],
+        forced_clients: Optional[List[int]] = None,
+    ):
+        round_dir = os.path.join(
+            self.args.output_dir,
+            "eval_rounds",
+            f"round_{round_idx + 1}",
+        )
+        os.makedirs(round_dir, exist_ok=True)
+        payload = {
+            "round": round_idx + 1,
+            "selected_clients": [int(idx) for idx in selected_clients],
+            "forced_clients": [int(idx) for idx in (forced_clients or [])],
+            "source_clients": [int(idx) for idx in self.current_round_source_clients],
+            "source_to_targets": {
+                str(src): [int(tgt) for tgt in tgts]
+                for src, tgts in self.current_round_source_to_targets.items()
+            },
+            "participation_ratio": self.participation_ratio,
+            "min_participating_clients": self.min_participating_clients,
+        }
+        with open(os.path.join(round_dir, "participation.json"), "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
     def _resolve_unlearn_base_path(self, round_idx: int):
         """
         Map unlearn round index to a checkpoint path across full+unlearn rounds.
@@ -401,6 +593,14 @@ class FederatedPermTrainer(FinetuneTrainer):
                 and round_idx >= self.recovery_round_start
                 and not is_forget_round
             )
+            selected_clients = self._select_participating_clients(round_idx, is_forget_round)
+            self.selected_clients = set(selected_clients)
+            self._assign_round_source_targets(round_idx)
+            self._save_participation_metadata(
+                round_idx,
+                selected_clients,
+                forced_clients=self._required_participating_clients(round_idx, is_forget_round),
+            )
             # 动态切换恢复阶段学习率（若指定）
             if recovery_due and self.recovery_learning_rate is not None:
                 if getattr(self.args, "learning_rate", None) != self.recovery_learning_rate:
@@ -417,8 +617,8 @@ class FederatedPermTrainer(FinetuneTrainer):
 
             # Phase 1: Client Selection & Distribution
             logger.info("Phase 1: Client Selection & Distribution")
-            self.client_models = [deepcopy(self.model) for _ in range(self.num_clients)]
-            self.client_data_sizes = []
+            self.client_models = [None] * self.num_clients
+            self.client_data_sizes = [0] * self.num_clients
             
             # Get global model state (extract without moving to CPU first)
             if self.is_peft:
@@ -435,14 +635,16 @@ class FederatedPermTrainer(FinetuneTrainer):
                 )
             
             # Distribute models to clients
-            self.client_data_sizes = []
             for client_idx in range(self.num_clients):
                 if client_idx not in self.federated_dataset:
                     logger.warning(f"Skipping client {client_idx} as no data is available")
-                    self.client_data_sizes.append(0)
+                    continue
+                if client_idx not in self.selected_clients:
+                    logger.info(f"Skipping client {client_idx} this round due to participation sampling")
                     continue
                 
-                client_model = self.client_models[client_idx]
+                client_model = deepcopy(self.model).cpu()
+                self.client_models[client_idx] = client_model
                 client_container = self.federated_dataset[client_idx]
                 client_dataset = self._select_train_dataset(client_container)
                 
@@ -476,7 +678,7 @@ class FederatedPermTrainer(FinetuneTrainer):
                     logger.info(f"Client {client_idx} received normal model")
                 
                 client_data_size = len(client_dataset) if client_dataset is not None else 0
-                self.client_data_sizes.append(client_data_size)
+                self.client_data_sizes[client_idx] = client_data_size
 
                 # 训练前评测（逐客户端）：不再复用 server 评测结果
                 if self.enable_pre_eval and self._should_eval_client(client_idx):
@@ -495,7 +697,7 @@ class FederatedPermTrainer(FinetuneTrainer):
             client_initial_states = [None] * self.num_clients
             client_updated_states = [None] * self.num_clients
             client_task_specs = []
-            for client_idx in range(self.num_clients):
+            for client_idx in selected_clients:
                 if client_idx not in self.federated_dataset:
                     continue
 
@@ -528,7 +730,7 @@ class FederatedPermTrainer(FinetuneTrainer):
                 client_task_specs.append(
                     {
                         "client_idx": client_idx,
-                        "client_model": deepcopy(client_model).cpu(),
+                        "client_model": client_model,
                         "client_dataset": client_dataset,
                         "prev_teacher": deepcopy(prev_teacher).cpu() if prev_teacher is not None else None,
                     }
@@ -554,7 +756,7 @@ class FederatedPermTrainer(FinetuneTrainer):
                 self.client_models[client_idx] = trained_model
 
             # 训练后评测（串行，避免共享 evaluator 的并发问题）
-            for client_idx in range(self.num_clients):
+            for client_idx in selected_clients:
                 trained_model = self.client_models[client_idx] if client_idx < len(self.client_models) else None
                 if trained_model is None or not self._should_eval_client(client_idx):
                     continue
@@ -563,6 +765,17 @@ class FederatedPermTrainer(FinetuneTrainer):
                     round_idx=round_idx,
                     stage=f"client{client_idx}_post_train",
                 )
+                if should_run_target_round_forget_merge_eval(
+                    self.eval_target_round_forget_merge,
+                    client_idx,
+                    self._forget_eval_sources(),
+                    self._active_source_to_targets(),
+                ):
+                    self._maybe_evaluate_model(
+                        model=trained_model,
+                        round_idx=round_idx,
+                        stage=f"client{client_idx}_post_train{ROUND_FORGET_MERGE_STAGE_SUFFIX}",
+                    )
 
             # Phase 3: Secure Aggregation
             logger.info("Phase 3: Secure Aggregation")
@@ -608,14 +821,22 @@ class FederatedPermTrainer(FinetuneTrainer):
             retain_idx_path = os.path.join(split_dir, f"client{client_idx}_retain_indices.json")
         return split_dir, retain_idx_path
 
+    def _forget_eval_sources(self) -> List[int]:
+        if self.current_round_source_clients:
+            return list(self.current_round_source_clients)
+        return sorted(
+            idx for idx in self.source_client_indices if idx in self.selected_clients
+        )
+
     def _set_eval_indices(self, stage: str, forget_source_idx: int):
         split_dir, retain_idx_path = self._resolve_eval_retain_indices_path(stage)
         forget_idx_path = resolve_forget_indices_path(
             split_dir=split_dir,
             stage=stage,
-            source_to_targets=self.source_to_targets,
-            source_client_indices=self.source_client_indices,
+            source_to_targets=self._active_source_to_targets(),
+            source_client_indices=self._forget_eval_sources(),
             forget_source_idx=forget_source_idx,
+            active_source_client_indices=self._forget_eval_sources(),
         )
 
         if hasattr(self.evaluator, "eval_cfg"):
@@ -668,7 +889,14 @@ class FederatedPermTrainer(FinetuneTrainer):
             except Exception as exc:
                 logger.warning(f"Failed to parse FEDPERM_SKIP_EVAL_ROUNDS='{skip_rounds_env}': {exc}")
 
-        forget_sources = self.source_client_indices or [self.revoker_client_idx]
+        forget_sources = self._forget_eval_sources()
+        if self.source_client_indices and not forget_sources:
+            logger.info(
+                "No sampled source clients selected at round %s; skip eval for stage %s",
+                round_idx + 1,
+                stage,
+            )
+            return
         force_eval = os.environ.get("FORCE_FEDPERM_EVAL", "0") in ("1", "true", "True")
         overwrite = True
         if hasattr(self.evaluator, "eval_cfg"):
@@ -682,7 +910,10 @@ class FederatedPermTrainer(FinetuneTrainer):
 
         try:
             for eval_stage, forget_source_idx in build_eval_variants(
-                stage, forget_sources
+                stage,
+                forget_sources,
+                source_to_targets=self._active_source_to_targets(),
+                source_client_indices=self._forget_eval_sources(),
             ):
                 eval_dir = os.path.join(
                     self.args.output_dir,
@@ -703,7 +934,7 @@ class FederatedPermTrainer(FinetuneTrainer):
                     continue
 
                 try:
-                    self._set_eval_indices(stage, forget_source_idx)
+                    self._set_eval_indices(eval_stage, forget_source_idx)
                 except Exception as exc:
                     logger.warning(
                         f"Failed to set eval indices for stage {eval_stage}: {exc}"
@@ -734,8 +965,16 @@ class FederatedPermTrainer(FinetuneTrainer):
         """
         if self.evaluator is None or round_idx == 0:
             return False
+        if self.source_client_indices and not self._forget_eval_sources():
+            return False
+        _, forget_source_idx = split_stage_for_forget_source(target_stage)
         # 遗忘阶段或已持有过滤器时，目标客户端需要重新评测
-        if client_idx in self.target_to_sources and (
+        current_targets = (
+            set(self._active_source_to_targets().get(forget_source_idx, []))
+            if forget_source_idx is not None
+            else set(self._invert_source_to_targets(self._active_source_to_targets()).keys())
+        )
+        if client_idx in current_targets and (
             self.revocation_status or self.target_filters.get(client_idx) is not None
         ):
             return False
@@ -743,8 +982,8 @@ class FederatedPermTrainer(FinetuneTrainer):
         src_stage = resolve_server_post_reuse_stage(
             target_stage=target_stage,
             client_idx=client_idx,
-            source_to_targets=self.source_to_targets,
-            source_client_indices=self.source_client_indices,
+            source_to_targets=self._active_source_to_targets(),
+            source_client_indices=self._forget_eval_sources(),
         )
         if src_stage is None:
             return False
@@ -841,10 +1080,14 @@ class FederatedPermTrainer(FinetuneTrainer):
         from trainer import TRAINER_REGISTRY
         trainer_cls = TRAINER_REGISTRY.get(self.unlearn_trainer_cls, None)
         if trainer_cls is None:
-            logger.warning(
-                f"Unrecognized unlearn_trainer_cls={self.unlearn_trainer_cls}; skip revocation for this round"
+            available = sorted(
+                k for k, v in TRAINER_REGISTRY.items() if isinstance(k, str)
             )
-            return
+            raise ValueError(
+                "Unrecognized unlearn_trainer_cls="
+                f"{self.unlearn_trainer_cls}; revocation cannot proceed. "
+                f"Available trainers: {available}"
+            )
 
         self.source_filters = {}
         source_task_specs = []
@@ -1207,11 +1450,21 @@ class FederatedPermTrainer(FinetuneTrainer):
         self._save_model_only(self.model, save_path)
         logger.info(f"Model saved at {save_path} (model only, tokenizer not duplicated)")
 
+        previous_target_models = dict(self.prev_target_models_post)
         self.prev_target_models_post = {}
         for target_client_idx in self.target_client_indices:
             if not (0 <= target_client_idx < len(self.client_models)):
                 continue
-            target_client_model = self.client_models[target_client_idx]
+            if target_client_idx in self.selected_clients:
+                target_client_model = self.client_models[target_client_idx]
+            else:
+                target_client_model = previous_target_models.get(target_client_idx)
+                if target_client_model is not None:
+                    logger.info(
+                        "Target client %s not selected at round %s; carrying forward last post-train checkpoint",
+                        target_client_idx,
+                        round_idx + 1,
+                    )
             if target_client_model is None:
                 continue
 

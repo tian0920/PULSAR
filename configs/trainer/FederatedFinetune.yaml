@@ -3,10 +3,14 @@ method_args:
   num_clients: 3  # Total number of clients in federated learning
   target_client_idx: null  # Optional: save target client checkpoint when enabled
   save_target_client_checkpoint: false  # Save target client checkpoint each round
+  save_target_client_final_only: false  # When true, persist target client checkpoints only at the final round
   aggregation_strategy: "FedAvg"  # FedAvg, FedAdam, FedYogi, FedAdagrad, FedAvgM
   global_rounds: 2  # Total number of global training rounds
   retain_ratio: 0.99  # Portion of data to retain when sampling retain/forget splits
   train_on: "full"  # Which split to train on: full / retain / forget
+  participation_ratio: 1.0
+  min_participating_clients: 1
+  participation_seed: null
   retain_split_name: null
   forget_split_name: null
   unlearn_epochs: null  # 占位以兼容脚本覆写（FedPerm 场景可忽略）

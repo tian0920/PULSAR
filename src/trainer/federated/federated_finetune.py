@@ -1,5 +1,6 @@
 import torch
 import logging
+import json
 from copy import deepcopy
 from typing import Dict, List, Any, Optional
 
@@ -12,13 +13,17 @@ import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
+import random
 from trainer.federated.eval_routing import (
+    ROUND_FORGET_MERGE_STAGE_SUFFIX,
     build_eval_variants,
     invert_source_to_targets,
     parse_client_stage,
+    format_stage_with_forget_source,
     resolve_forget_indices_path,
     resolve_server_post_reuse_stage,
     resolve_server_pre_reuse_stage,
+    should_run_target_round_forget_merge_eval,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,11 +74,8 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         )
         
         self.num_clients = num_clients
-        self.target_client_idx = target_client_idx
-        self.revoker_client_idx = int(kwargs.get("revoker_client_idx", 0))
         self.source_to_targets = self._resolve_source_to_targets(
             kwargs.get("source_to_targets", None),
-            target_client_idx=target_client_idx,
         )
         self.source_client_indices = sorted(self.source_to_targets.keys())
         self.target_to_sources = invert_source_to_targets(self.source_to_targets)
@@ -83,11 +85,35 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
             source_to_targets=self.source_to_targets,
         )
         self.save_target_client_checkpoint = save_target_client_checkpoint
+        self.save_target_client_final_only = bool(
+            kwargs.get("save_target_client_final_only", False)
+        )
         self.aggregation_strategy = aggregation_strategy
         self.global_rounds = global_rounds
         self.client_models = []
-        self.client_data_sizes = []  
+        self.client_state_dicts = []
+        self.client_data_sizes = []
+        self.latest_target_models_post = {}
+        self.selected_clients = set()
         self.kwargs = kwargs
+        self.participation_ratio = float(kwargs.get("participation_ratio", 1.0))
+        self.min_participating_clients = int(kwargs.get("min_participating_clients", 1))
+        participation_seed = kwargs.get("participation_seed", None)
+        if participation_seed is None:
+            participation_seed = getattr(self.args, "seed", 0)
+        self.participation_seed = int(participation_seed)
+        self.min_source_clients_per_round = int(kwargs.get("min_source_clients_per_round", 2))
+        self.targets_per_source_per_round = int(kwargs.get("targets_per_source_per_round", 2))
+        self.round_topology_seed = int(kwargs.get("round_topology_seed", self.participation_seed))
+        self.current_round_source_to_targets: Dict[int, List[int]] = {}
+        self.current_round_source_clients: List[int] = []
+        _etm = kwargs.get("eval_target_round_forget_merge", None)
+        if _etm is None:
+            self.eval_target_round_forget_merge = os.environ.get(
+                "EVAL_TARGET_ROUND_FORGET_MERGE", ""
+            ).lower() in ("1", "true", "yes", "on")
+        else:
+            self.eval_target_round_forget_merge = bool(_etm)
 
         # 单卡：客户端与服务器均使用同一设备
         self.train_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
@@ -139,8 +165,18 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         logger.info(f"Model type - PEFT: {self.is_peft}")
         logger.info(f"Client parallel devices: {self.client_parallel_devices}, workers={self.parallel_client_workers}")
         logger.info(f"Source clients for eval: {self.source_client_indices}")
+        logger.info(
+            "Client participation ratio: %s, min clients: %s, seed: %s",
+            self.participation_ratio,
+            self.min_participating_clients,
+            self.participation_seed,
+        )
         if self.save_target_client_checkpoint:
             logger.info(f"Save target client checkpoints: {self.target_client_indices}")
+            logger.info(
+                "Save target client final only: %s",
+                self.save_target_client_final_only,
+            )
 
     def _normalize_client_indices(self, client_indices):
         normalized = []
@@ -153,7 +189,7 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
             normalized.append(client_idx)
         return sorted(dict.fromkeys(normalized))
 
-    def _resolve_source_to_targets(self, source_to_targets, target_client_idx: Optional[int]):
+    def _resolve_source_to_targets(self, source_to_targets):
         if source_to_targets is None:
             return {}
         normalized = {}
@@ -228,12 +264,14 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
     def _run_parallel_tasks(self, task_specs, worker_fn, device_pool, requested_workers, task_label: str):
         task_count = len(task_specs)
         if task_count == 0:
-            return []
+            return
         devices = device_pool or [torch.device("cpu")]
         worker_count = self._resolve_worker_count(requested_workers, task_count, devices)
         if worker_count <= 1:
             logger.info(f"Running {task_count} {task_label} tasks sequentially")
-            return [worker_fn(task_spec, devices[idx % len(devices)]) for idx, task_spec in enumerate(task_specs)]
+            for idx, task_spec in enumerate(task_specs):
+                yield worker_fn(task_spec, devices[idx % len(devices)])
+            return
 
         logger.info(
             "Running %s %s tasks in parallel with %s workers on devices %s",
@@ -243,16 +281,177 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
             devices,
         )
         futures = {}
-        results = [None] * task_count
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             for idx, task_spec in enumerate(task_specs):
                 device = devices[idx % len(devices)]
                 future = executor.submit(worker_fn, task_spec, device)
                 futures[future] = idx
             for future in as_completed(futures):
-                result_idx = futures[future]
-                results[result_idx] = future.result()
-        return results
+                yield future.result()
+
+    def _eligible_clients(self) -> List[int]:
+        return [
+            client_idx for client_idx in range(self.num_clients) if client_idx in self.federated_dataset
+        ]
+
+    def _required_participating_clients(self, round_idx: int) -> List[int]:
+        eligible_clients = self._eligible_clients()
+        eligible_set = set(eligible_clients)
+        source_candidates = [
+            idx for idx in self.source_client_indices if idx in eligible_set
+        ]
+        target_candidates = [
+            idx for idx in self.target_client_indices if idx in eligible_set
+        ]
+        if self.source_client_indices and not source_candidates:
+            raise ValueError("No eligible source clients available for participation sampling")
+        if self.target_client_indices and not target_candidates:
+            raise ValueError("No eligible target clients available for participation sampling")
+        if source_candidates:
+            rng = random.Random(self.participation_seed + round_idx)
+            required_sources = min(
+                len(source_candidates),
+                max(1, self.min_source_clients_per_round),
+            )
+            forced_source_clients = sorted(rng.sample(source_candidates, required_sources))
+        else:
+            forced_source_clients = []
+        return sorted(
+            dict.fromkeys(
+                forced_source_clients
+                + select_forced_group_clients(
+                    eligible_clients=eligible_clients,
+                    client_groups=[source_candidates, target_candidates],
+                    round_idx=round_idx,
+                    seed=self.participation_seed,
+                )
+            )
+        )
+
+    def _active_source_to_targets(self) -> Dict[int, List[int]]:
+        return self.current_round_source_to_targets or self.source_to_targets
+
+    def _round_topology_cache_path(self) -> str:
+        split_dir = os.environ.get(
+            "FEDPERM_SPLIT_DIR", os.path.join(self.args.output_dir, "client_splits")
+        )
+        os.makedirs(split_dir, exist_ok=True)
+        return os.path.join(split_dir, "fedperm_round_topology.json")
+
+    def _load_round_topology(self, round_idx: int) -> Optional[Dict[str, Any]]:
+        cache_path = self._round_topology_cache_path()
+        if not os.path.isfile(cache_path):
+            return None
+        try:
+            with open(cache_path, "r") as f:
+                payload = json.load(f)
+            rounds = payload.get("rounds", {})
+            entry = rounds.get(str(round_idx + 1))
+            if not entry:
+                return None
+            return {
+                "source_clients": [int(idx) for idx in entry.get("source_clients", [])],
+                "source_to_targets": {
+                    int(src): [int(tgt) for tgt in tgts]
+                    for src, tgts in (entry.get("source_to_targets", {}) or {}).items()
+                },
+            }
+        except Exception as exc:
+            logger.warning("Failed to load round topology cache: %s", exc)
+            return None
+
+    def _save_round_topology(self, round_idx: int):
+        cache_path = self._round_topology_cache_path()
+        payload = {"rounds": {}}
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path, "r") as f:
+                    payload = json.load(f)
+            except Exception:
+                payload = {"rounds": {}}
+        payload.setdefault("rounds", {})
+        payload["rounds"][str(round_idx + 1)] = {
+            "source_clients": [int(idx) for idx in self.current_round_source_clients],
+            "source_to_targets": {
+                str(src): [int(tgt) for tgt in tgts]
+                for src, tgts in self.current_round_source_to_targets.items()
+            },
+            "seed": int(self.round_topology_seed),
+        }
+        with open(cache_path, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    def _assign_round_source_targets(self, round_idx: int):
+        cached = self._load_round_topology(round_idx)
+        if cached:
+            self.current_round_source_clients = cached["source_clients"]
+            self.current_round_source_to_targets = cached["source_to_targets"]
+            return
+        selected = sorted(int(idx) for idx in self.selected_clients)
+        selected_set = set(selected)
+        source_pool = [idx for idx in self.source_client_indices if idx in selected_set]
+        if len(source_pool) < self.min_source_clients_per_round:
+            source_pool = selected
+        required_sources = min(len(source_pool), max(1, self.min_source_clients_per_round))
+        rng = random.Random(self.round_topology_seed + round_idx)
+        round_sources = sorted(rng.sample(source_pool, required_sources)) if required_sources > 0 else []
+        candidate_targets = [idx for idx in selected if idx not in round_sources]
+        mapping: Dict[int, List[int]] = {}
+        for offset, src_idx in enumerate(round_sources):
+            if not candidate_targets:
+                mapping[src_idx] = []
+                continue
+            local_rng = random.Random(self.round_topology_seed + round_idx * 9973 + offset + 1)
+            sample_n = min(len(candidate_targets), max(1, self.targets_per_source_per_round))
+            mapping[src_idx] = sorted(local_rng.sample(candidate_targets, sample_n))
+        self.current_round_source_clients = round_sources
+        self.current_round_source_to_targets = mapping
+        self._save_round_topology(round_idx)
+
+    def _select_participating_clients(self, round_idx: int) -> List[int]:
+        required_clients = self._required_participating_clients(round_idx)
+        selected = sample_participating_clients(
+            eligible_clients=self._eligible_clients(),
+            participation_ratio=self.participation_ratio,
+            min_clients=self.min_participating_clients,
+            round_idx=round_idx,
+            seed=self.participation_seed,
+            forced_clients=required_clients,
+        )
+        logger.info(
+            "Round %s selected clients: %s%s",
+            round_idx + 1,
+            selected,
+            f" (forced={required_clients})" if required_clients else "",
+        )
+        return selected
+
+    def _save_participation_metadata(
+        self,
+        round_idx: int,
+        selected_clients: List[int],
+        forced_clients: Optional[List[int]] = None,
+    ):
+        round_dir = os.path.join(
+            self.args.output_dir,
+            "eval_rounds",
+            f"round_{round_idx + 1}",
+        )
+        os.makedirs(round_dir, exist_ok=True)
+        payload = {
+            "round": round_idx + 1,
+            "selected_clients": [int(idx) for idx in selected_clients],
+            "forced_clients": [int(idx) for idx in (forced_clients or [])],
+            "source_clients": [int(idx) for idx in self.current_round_source_clients],
+            "source_to_targets": {
+                str(src): [int(tgt) for tgt in tgts]
+                for src, tgts in self.current_round_source_to_targets.items()
+            },
+            "participation_ratio": self.participation_ratio,
+            "min_participating_clients": self.min_participating_clients,
+        }
+        with open(os.path.join(round_dir, "participation.json"), "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
 
     def train(self, **kwargs):
 
@@ -266,9 +465,18 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
             return None
         if start_round > 0:
             logger.info(f"Resuming federated finetune from round {start_round + 1}")
+            self._load_latest_target_models(start_round)
 
         for round_idx in range(start_round, self.global_rounds):
             logger.info(f"Starting global round {round_idx + 1}/{self.global_rounds}")
+            selected_clients = self._select_participating_clients(round_idx)
+            self.selected_clients = set(selected_clients)
+            self._assign_round_source_targets(round_idx)
+            self._save_participation_metadata(
+                round_idx,
+                selected_clients,
+                forced_clients=self._required_participating_clients(round_idx),
+            )
             
             # Server-side eval before broadcasting (聚合前评测)
             if self.enable_pre_eval:
@@ -278,8 +486,9 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                     stage="server_pre_agg",
                 )
 
-            self.client_models = [deepcopy(self.model) for _ in range(self.num_clients)]
-            self.client_data_sizes = []  
+            self.client_models = [None] * self.num_clients
+            self.client_state_dicts = [None] * self.num_clients
+            self.client_data_sizes = [0] * self.num_clients
 
 
             logger.info(f"Aggregation strategy: {self.aggregation_strategy}")
@@ -287,15 +496,18 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
             for client_idx in range(self.num_clients):
                 if client_idx not in self.federated_dataset:
                     logger.warning(f"Skipping client {client_idx} as no data is available")
-                    self.client_data_sizes.append(0)  
                     continue
-                    
-                client_model = self.client_models[client_idx]
+                if client_idx not in self.selected_clients:
+                    logger.info(f"Skipping client {client_idx} this round due to participation sampling")
+                    continue
+
+                client_model = deepcopy(self.model).cpu()
+                self.client_models[client_idx] = client_model
                 client_container = self.federated_dataset[client_idx]
                 client_dataset = self._select_train_dataset(client_container)
 
                 client_data_size = len(client_dataset) if client_dataset is not None else 0
-                self.client_data_sizes.append(client_data_size)
+                self.client_data_sizes[client_idx] = client_data_size
                 
                 # Client-side eval before local training：第 1 轮直接复用 server_pre_agg，其余轮次复用上一轮 server_post_agg
                 if self.enable_pre_eval:
@@ -314,7 +526,7 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 client_task_specs.append(
                     {
                         "client_idx": client_idx,
-                        "client_model": deepcopy(client_model).cpu(),
+                        "client_model": client_model,
                         "client_dataset": client_dataset,
                     }
                 )
@@ -334,18 +546,39 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 self.parallel_client_workers,
                 task_label="client-train",
             ):
-                self.client_models[client_idx] = trained_client_model
-
-            # Client-side eval after local training（串行以避免 evaluator 并发冲突）
-            for client_idx in range(self.num_clients):
-                trained_client_model = self.client_models[client_idx] if client_idx < len(self.client_models) else None
-                if trained_client_model is None:
-                    continue
                 self._maybe_evaluate_model(
                     model=trained_client_model,
                     round_idx=round_idx,
                     stage=f"client{client_idx}_post_train",
                 )
+                if should_run_target_round_forget_merge_eval(
+                    self.eval_target_round_forget_merge,
+                    client_idx,
+                    self._forget_eval_sources(),
+                    self._active_source_to_targets(),
+                ):
+                    self._maybe_evaluate_model(
+                        model=trained_client_model,
+                        round_idx=round_idx,
+                        stage=f"client{client_idx}_post_train{ROUND_FORGET_MERGE_STAGE_SUFFIX}",
+                    )
+                self.client_models[client_idx] = trained_client_model
+                if self.is_peft:
+                    client_state_dict = {
+                        key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
+                        for key, value in get_peft_model_state_dict(trained_client_model).items()
+                    }
+                else:
+                    client_state_dict = {
+                        key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
+                        for key, value in trained_client_model.state_dict().items()
+                    }
+                self.client_state_dicts[client_idx] = client_state_dict
+                if self.save_target_client_checkpoint and client_idx in self.target_client_indices:
+                    self.latest_target_models_post[client_idx] = deepcopy(trained_client_model).cpu()
+                del trained_client_model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
  
             self.aggregate_models(round_idx)
@@ -374,16 +607,28 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         """Optionally persist target clients' post-train checkpoints."""
         if not self.save_target_client_checkpoint:
             return
+        if self.save_target_client_final_only and round_idx != self.global_rounds - 1:
+            logger.info(
+                "Skip saving target client checkpoints at round %s; final-only mode enabled",
+                round_idx + 1,
+            )
+            return
         if not self.target_client_indices:
             logger.warning("save_target_client_checkpoint enabled but no target clients are resolved; skip.")
             return
         for target_client_idx in self.target_client_indices:
-            if target_client_idx >= len(self.client_models):
+            if not (0 <= target_client_idx < self.num_clients):
                 logger.warning(
-                    f"target_client_idx {target_client_idx} out of range for {len(self.client_models)} clients; skip."
+                    f"target_client_idx {target_client_idx} out of range for num_clients={self.num_clients}; skip."
                 )
                 continue
-            target_client_model = self.client_models[target_client_idx]
+            target_client_model = self.latest_target_models_post.get(target_client_idx)
+            if target_client_idx not in self.selected_clients and target_client_model is not None:
+                logger.info(
+                    "Target client %s not selected at round %s; carrying forward last post-train checkpoint",
+                    target_client_idx,
+                    round_idx + 1,
+                )
             if target_client_model is None:
                 logger.warning(f"Target client {target_client_idx} model missing; skip.")
                 continue
@@ -399,6 +644,37 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                 target_client_model = target_client_model.cpu()
                 torch.save(target_client_model.state_dict(), os.path.join(target_dir, "pytorch_model.bin"))
             logger.info(f"Target client {target_client_idx} model saved at {target_dir}")
+
+    def _load_latest_target_models(self, round_idx: int):
+        if not self.save_target_client_checkpoint:
+            return
+        loaded_models = {}
+        for target_client_idx in self.target_client_indices:
+            target_dir = os.path.join(
+                self.args.output_dir,
+                f"round_{round_idx}_target_client_{target_client_idx}",
+            )
+            if not os.path.isdir(target_dir):
+                continue
+            try:
+                teacher = deepcopy(self.model).cpu()
+                if self.is_peft:
+                    state_dict = self._load_peft_state(target_dir, f"target client {target_client_idx}")
+                    set_peft_model_state_dict(teacher, state_dict)
+                else:
+                    weight_path = os.path.join(target_dir, "pytorch_model.bin")
+                    if not os.path.isfile(weight_path):
+                        raise FileNotFoundError(f"pytorch_model.bin not found in {target_dir}")
+                    teacher.load_state_dict(torch.load(weight_path, map_location="cpu"))
+                loaded_models[target_client_idx] = teacher.cpu()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to preload target client %s checkpoint from %s: %s",
+                    target_client_idx,
+                    target_dir,
+                    exc,
+                )
+        self.latest_target_models_post = loaded_models
 
     def train_client_model(self, client_model, client_dataset, device=None):
         # Move client model to GPU if available (Trainer will handle device placement, but we ensure it's on GPU)
@@ -519,12 +795,14 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
 
     def _set_eval_indices(self, stage: str, forget_source_idx: int):
         split_dir, retain_idx_path = self._resolve_eval_retain_indices_path(stage)
+        active_map = self._active_source_to_targets()
         forget_idx_path = resolve_forget_indices_path(
             split_dir=split_dir,
             stage=stage,
-            source_to_targets=self.source_to_targets,
-            source_client_indices=self.source_client_indices,
+            source_to_targets=active_map,
+            source_client_indices=sorted(active_map.keys()),
             forget_source_idx=forget_source_idx,
+            active_source_client_indices=self._forget_eval_sources(),
         )
 
         if hasattr(self.evaluator, "eval_cfg"):
@@ -553,7 +831,11 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         self._clear_evaluator_cache()
 
     def _forget_eval_sources(self):
-        return self.source_client_indices or [self.revoker_client_idx]
+        if self.current_round_source_clients:
+            return list(self.current_round_source_clients)
+        return sorted(
+            idx for idx in self.source_client_indices if idx in self.selected_clients
+        )
 
     def _maybe_evaluate_model(self, model, round_idx: int, stage: str):
         """
@@ -582,8 +864,18 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
 
         try:
             forget_sources = self._forget_eval_sources()
+            if self.source_client_indices and not forget_sources:
+                logger.info(
+                    "No sampled source clients selected at round %s; skip eval for stage %s",
+                    round_idx + 1,
+                    stage,
+                )
+                return
             for eval_stage, forget_source_idx in build_eval_variants(
-                stage, forget_sources
+                stage,
+                forget_sources,
+                source_to_targets=self._active_source_to_targets(),
+                source_client_indices=self._forget_eval_sources(),
             ):
                 eval_dir = os.path.join(
                     self.args.output_dir,
@@ -602,7 +894,7 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
                     continue
 
                 try:
-                    self._set_eval_indices(stage, forget_source_idx)
+                    self._set_eval_indices(eval_stage, forget_source_idx)
                 except Exception as exc:
                     logger.warning(
                         f"Failed to set eval indices for stage {eval_stage}: {exc}"
@@ -647,14 +939,16 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         """
         if self.evaluator is None or round_idx == 0:
             return False
+        if self.source_client_indices and not self._forget_eval_sources():
+            return False
         copied = False
         client_idx = parse_client_stage(target_stage)
         if client_idx is not None:
             src_stage = resolve_server_post_reuse_stage(
                 target_stage=target_stage,
                 client_idx=client_idx,
-                source_to_targets=self.source_to_targets,
-                source_client_indices=self.source_client_indices,
+                source_to_targets=self._active_source_to_targets(),
+                source_client_indices=self._forget_eval_sources(),
             )
             if src_stage is None:
                 return False
@@ -674,16 +968,15 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         else:
             forget_sources = self._forget_eval_sources()
             for eval_stage, forget_source_idx in build_eval_variants(
-                target_stage, forget_sources
+                target_stage,
+                forget_sources,
+                source_to_targets=self._active_source_to_targets(),
+                source_client_indices=self._forget_eval_sources(),
             ):
                 src_stage = (
                     "server_post_agg"
                     if forget_source_idx is None
-                    else (
-                        "server_post_agg"
-                        if len(forget_sources) == 1
-                        else f"server_post_agg__forget_src_{forget_source_idx}"
-                    )
+                    else format_stage_with_forget_source("server_post_agg", forget_source_idx)
                 )
                 prev_dir = os.path.join(
                     self.args.output_dir,
@@ -710,14 +1003,16 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         """
         if self.evaluator is None:
             return False
+        if self.source_client_indices and not self._forget_eval_sources():
+            return False
         copied = False
         client_idx = parse_client_stage(target_stage)
         if client_idx is not None:
             src_stage = resolve_server_pre_reuse_stage(
                 target_stage=target_stage,
                 client_idx=client_idx,
-                source_to_targets=self.source_to_targets,
-                source_client_indices=self.source_client_indices,
+                source_to_targets=self._active_source_to_targets(),
+                source_client_indices=self._forget_eval_sources(),
             )
             if src_stage is None:
                 return False
@@ -737,16 +1032,15 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         else:
             forget_sources = self._forget_eval_sources()
             for eval_stage, forget_source_idx in build_eval_variants(
-                target_stage, forget_sources
+                target_stage,
+                forget_sources,
+                source_to_targets=self._active_source_to_targets(),
+                source_client_indices=self._forget_eval_sources(),
             ):
                 src_stage = (
                     "server_pre_agg"
                     if forget_source_idx is None
-                    else (
-                        "server_pre_agg"
-                        if len(forget_sources) == 1
-                        else f"server_pre_agg__forget_src_{forget_source_idx}"
-                    )
+                    else format_stage_with_forget_source("server_pre_agg", forget_source_idx)
                 )
                 src_dir = os.path.join(
                     self.args.output_dir,
@@ -770,15 +1064,27 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
     def aggregate_models(self, round_idx=0):
 
         logger.info("Aggregating client models")
-     
-        total_samples = sum(self.client_data_sizes)
-        if total_samples == 0:
+
+        active_client_indices = [
+            client_idx
+            for client_idx, model in enumerate(self.client_models)
+            if model is not None and self.client_data_sizes[client_idx] > 0
+        ]
+        total_samples = sum(self.client_data_sizes[client_idx] for client_idx in active_client_indices)
+        if total_samples == 0 or not active_client_indices:
             logger.warning("No samples available for aggregation")
             return
             
-        client_weights = [size / total_samples for size in self.client_data_sizes]
+        client_weights = [
+            self.client_data_sizes[client_idx] / total_samples
+            for client_idx in active_client_indices
+        ]
         logger.info(f"Client sample sizes: {self.client_data_sizes}")
-        logger.info(f"Client weights: {[f'{w:.4f}' for w in client_weights]}")
+        logger.info(
+            "Aggregating active clients: %s with weights: %s",
+            active_client_indices,
+            [f"{w:.4f}" for w in client_weights],
+        )
         
         # Determine target device for aggregation (prefer GPU if available)
         use_gpu_for_agg = self.server_device.type == "cuda" and torch.cuda.is_available()
@@ -787,7 +1093,8 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         if self.is_peft:
            
             client_state_dicts = []
-            for model in self.client_models:
+            for client_idx in active_client_indices:
+                model = self.client_models[client_idx]
                 # Extract state dict (can be done on GPU if model is on GPU)
                 peft_state_dict = get_peft_model_state_dict(model)
                 
@@ -805,7 +1112,8 @@ class FederatedFinetuneTrainer(FinetuneTrainer):
         else:
             # Extract state dicts and move to aggregation device
             client_state_dicts = []
-            for model in self.client_models:
+            for client_idx in active_client_indices:
+                model = self.client_models[client_idx]
                 state_dict = model.state_dict()
                 if use_gpu_for_agg:
                     state_dict = {k: v.to(agg_device) if isinstance(v, torch.Tensor) else v 

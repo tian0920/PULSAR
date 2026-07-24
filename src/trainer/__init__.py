@@ -12,6 +12,10 @@ from trainer.unlearn.npo import NPO
 from trainer.unlearn.dpo import DPO
 from trainer.unlearn.simnpo import SimNPO
 from trainer.unlearn.rmu import RMU
+from trainer.unlearn.ceu import CEU
+from trainer.unlearn.pdu import PDU
+from trainer.unlearn.undial import UNDIAL
+from trainer.unlearn.wga import WGA
 from trainer.federated.federated_perm import FederatedPermTrainer
 from trainer.federated.federated_unlearning import FederatedUnlearningTrainer
 from trainer.federated.federated_finetune import FederatedFinetuneTrainer
@@ -36,14 +40,30 @@ def load_trainer_args(trainer_args: DictConfig, dataset):
     trainer_args = dict(trainer_args)
     warmup_epochs = trainer_args.pop("warmup_epochs", None)
     if warmup_epochs:
-        batch_size = trainer_args["per_device_train_batch_size"]
-        grad_accum_steps = trainer_args["gradient_accumulation_steps"]
-        num_devices = torch.cuda.device_count()
-        dataset_len = len(dataset)
-        trainer_args["warmup_steps"] = int(
-            (warmup_epochs * dataset_len)
-            // (batch_size * grad_accum_steps * num_devices)
-        )
+        if dataset is None:
+            logger.warning(
+                "warmup_epochs=%s ignored: train_dataset is None; set warmup_steps in config if needed.",
+                warmup_epochs,
+            )
+        else:
+            batch_size = trainer_args["per_device_train_batch_size"]
+            grad_accum_steps = trainer_args["gradient_accumulation_steps"]
+            # CPU 或未检测到 GPU 时 cuda.device_count() 为 0，会导致分母为 0
+            num_devices = max(1, int(torch.cuda.device_count()))
+            dataset_len = len(dataset)
+            denom = batch_size * grad_accum_steps * num_devices
+            if denom < 1:
+                logger.warning(
+                    "warmup_steps set to 0: batch_size=%s grad_accum=%s devices=%s gives zero denominator.",
+                    batch_size,
+                    grad_accum_steps,
+                    num_devices,
+                )
+                trainer_args["warmup_steps"] = 0
+            else:
+                trainer_args["warmup_steps"] = int(
+                    (warmup_epochs * dataset_len) // denom
+                )
 
     custom_args = {}
     for key in CUSTOM_TRAINER_ARG_KEYS:

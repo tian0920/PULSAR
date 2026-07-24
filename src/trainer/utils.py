@@ -80,3 +80,36 @@ def compute_dpo_loss(model, ref_model, win_inputs=None, lose_inputs=None, beta=1
 
     loss = -2 / beta * F.logsigmoid(beta * (win_log_ratio - lose_log_ratio)).mean()
     return loss, (win_outputs, lose_outputs)
+
+def compute_undial_loss(model, ref_model, inputs, beta=1.0):
+    """
+    UNDIAL forget loss.
+    Use token-level KL against a fixed reference model on the forget batch and
+    scale it by beta, matching the trainer's expectation that larger beta
+    strengthens the forget-side penalty.
+    """
+    with torch.no_grad():
+        ref_outputs = ref_model(**inputs)
+
+    outputs = model(**inputs)
+    ref_log_probs = F.log_softmax(ref_outputs.logits, dim=-1)
+    cur_log_probs = F.log_softmax(outputs.logits, dim=-1)
+
+    loss = F.kl_div(
+        cur_log_probs,
+        ref_log_probs,
+        reduction="batchmean",
+        log_target=True,
+    )
+    return beta * loss, outputs
+
+
+def compute_wga_loss(model, inputs, beta=1.0):
+    """
+    Weighted Gradient Ascent forget loss.
+    Reuse the model's supervised loss on the forget batch and negate it so the
+    optimizer ascends the forget objective; beta controls the forget strength.
+    """
+    outputs = model(**inputs)
+    loss = -beta * outputs.loss
+    return loss, outputs

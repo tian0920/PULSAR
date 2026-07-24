@@ -90,6 +90,8 @@ class CEU(UnlearnTrainer):
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         forget_inputs = inputs["forget"]
+        if isinstance(forget_inputs, dict) and "forget" in forget_inputs:
+            forget_inputs = forget_inputs["forget"]
         loss, outputs = compute_batch_ceu(
             model,
             forget_inputs,

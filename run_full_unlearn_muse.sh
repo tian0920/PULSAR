@@ -54,9 +54,8 @@ DATASET_PATH="muse-bench/MUSE-News"
 DATASET_NAME="train"
 TEXT_KEY="text"
 
-USE_CLIENT_FORGET_EVAL=true
 
-ASSIGN_FORGET_TO_REVOKER_ONLY=false   # 数据集划分方式
+ASSIGN_FORGET_TO_REVOKER_ONLY=true   # 数据集划分方式
 if [ "${ASSIGN_FORGET_TO_REVOKER_ONLY}" = "true" ]; then
   LOG_ROOT="logs/MUSE/fedperm_only"
   OUT_ROOT="saves/MUSE/fedperm_only"
@@ -68,9 +67,6 @@ fi
 # 强制评测使用 muse 组，避免 eval=tofu 时注入失败
 EVAL_GROUP="muse"
 
-TARGET_CLIENT_IDX=1
-REVOKER_CLIENT_IDX=0
-CLIENT_C_IDX=2
 ENABLE_PERMUTATION=false   # 神经元转置
 
 FULL_GLOBAL_ROUNDS=5     # full阶段的通信轮次
@@ -132,12 +128,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
       echo "Skip full training, final round exists: ${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}"
     else
       EXTRA_EVAL_ARGS=()
-      if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
-        EXTRA_EVAL_ARGS+=(
-          +eval.muse.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
-          +eval.muse.forget_split="${FORGET_SPLIT}"
-        )
-      fi
       if [ -f "${RETAIN_IDX_FILE}" ] && [ -f "${FORGET_IDX_FILE}" ]; then
         EXTRA_EVAL_ARGS+=(
           +trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}"
@@ -162,9 +152,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         trainer.method_args.forget_split_name="${FORGET_SPLIT}" \
         trainer.method_args.save_client_splits_for_eval=true \
         trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
-        trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
-        trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
-        trainer.method_args.eval_client_c_idx="${CLIENT_C_IDX}" \
         +trainer.method_args.retain_dataset_handler="${DATASET_HANDLER}" \
         +trainer.method_args.retain_dataset_hf_args.path="${DATASET_PATH}" \
         +trainer.method_args.retain_dataset_hf_args.name="${DATASET_NAME}" \
@@ -216,12 +203,6 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
         echo "Skip FedPerm unlearn, final round exists: ${FEDPERM_DIR}/round_${UNLEARN_GLOBAL_ROUNDS}"
       else
         EXTRA_EVAL_ARGS=()
-        if [ "${USE_CLIENT_FORGET_EVAL}" = "true" ]; then
-          EXTRA_EVAL_ARGS+=(
-            +eval.muse.forget_indices_path="${CLIENT_SPLIT_DIR}/client${REVOKER_CLIENT_IDX}_forget_indices.json"
-            +eval.muse.forget_split="${FORGET_SPLIT}"
-          )
-        fi
         SKIP_ROUNDS=$(compute_skip_rounds "${UNLEARN_GLOBAL_ROUNDS}" "${UNLEARN_SAVE_INTERVAL}")
         FEDPERM_SKIP_EVAL_ROUNDS="${SKIP_ROUNDS}" \
         FEDPERM_SKIP_SAVE_ROUNDS="${SKIP_ROUNDS}" \
@@ -245,14 +226,12 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.method_args.save_client_splits_for_eval=true \
           trainer.method_args.retain_indices_path="${RETAIN_IDX_FILE}" \
           trainer.method_args.forget_indices_path="${FORGET_IDX_FILE}" \
-          trainer.method_args.target_client_idx="${TARGET_CLIENT_IDX}" \
-          trainer.method_args.revoker_client_idx="${REVOKER_CLIENT_IDX}" \
           trainer.method_args.assign_forget_to_revoker_only="${ASSIGN_FORGET_TO_REVOKER_ONLY}" \
-          trainer.method_args.eval_client_c_idx="${CLIENT_C_IDX}" \
           trainer.method_args.target_prev_ce_enabled="${TARGET_PREV_CE_ENABLED}" \
           trainer.method_args.target_prev_ce_weight="${TARGET_PREV_CE_WEIGHT}" \
+          +trainer.method_args.unlearn_base_full_rounds="${FULL_GLOBAL_ROUNDS}" \
           +trainer.method_args.filter_base_model_path="${FILTER_BASE_DIR}" \
-          trainer.method_args.prev_target_model_path="${FULL_DIR}/round_${FULL_GLOBAL_ROUNDS}_target_client_${TARGET_CLIENT_IDX}" \
+          +trainer.method_args.round_offset="${FULL_GLOBAL_ROUNDS}" \
           +trainer.method_args.enable_permutation="${ENABLE_PERMUTATION}" \
           +trainer.method_args.retain_dataset_handler="${DATASET_HANDLER}" \
           +trainer.method_args.retain_dataset_hf_args.path="${DATASET_PATH}" \
@@ -271,7 +250,7 @@ for CURRENT_FL_METHOD in "${FL_METHODS[@]}"; do
           trainer.args.output_dir="${FEDPERM_DIR}" \
           trainer.args.save_strategy="epoch" \
           paths.output_dir="${FEDPERM_DIR}" \
-          trainer.args.seed="${SEED}" \
+          trainer.args.seed="$((SEED + FULL_GLOBAL_ROUNDS))" \
           "${EXTRA_EVAL_ARGS[@]}" \
           2>&1 | tee "${LOG_ROOT}/${FEDPERM_TASK}.txt"
       fi
